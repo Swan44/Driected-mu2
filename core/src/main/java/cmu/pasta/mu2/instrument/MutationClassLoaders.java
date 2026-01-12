@@ -70,7 +70,7 @@ public class MutationClassLoaders {
   /**
    * Returns the class loader which is used for initial test execution in order to compute mutants
    * and other probes for optimization.
-   *
+   * 返回用于初始测试执行的类加载器。以便计算变异体和其他插桩信息以进行优化
    * @return the class loader
    */
   public CartographyClassLoader getCartographyClassLoader() {

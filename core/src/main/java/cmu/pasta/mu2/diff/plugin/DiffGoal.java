@@ -49,7 +49,7 @@ public class DiffGoal extends AbstractMojo {
     /**
      * The fully-qualified name of the test class containing methods
      * to fuzz.
-     *
+     * 测试类名称
      * <p>This class will be loaded using the Maven project's test
      * classpath. It must be annotated with {@code @RunWith(JQF.class)}</p>
      */
@@ -58,7 +58,7 @@ public class DiffGoal extends AbstractMojo {
 
     /**
      * The name of the method to fuzz.
-     *
+     * 执行模糊测试的测试方法名称 @Fuzz注解 测试类中不能存在多个同名方法
      * <p>This method must be annotated with {@code @Fuzz}, and take
      * one or more arguments (with optional junit-quickcheck
      * annotations) whose values will be fuzzed by JQF.</p>
@@ -122,6 +122,16 @@ public class DiffGoal extends AbstractMojo {
      * seed is chosen randomly based on system state.
      * </p>
      */
+    /**
+     * /**
+     *      * 用于初始化模糊测试算法中随机源的种子值。
+     *      *
+     *      * <p>
+     *      * 将此属性设置为任意值将使得在相同输入条件下运行相同的模糊测试器产生相同的结果。
+     *      * 这对于测试模糊测试器本身很有用，但不应用于试图发现实际缺陷的代码测试。
+     *      * 默认情况下，种子会根据系统状态随机选择。
+     *      * </p>
+     *      */
     @Parameter(property="randomSeed")
     private Long randomSeed;
 
@@ -173,12 +183,12 @@ public class DiffGoal extends AbstractMojo {
 
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
-        ClassLoader loader;
-        MutationGuidance guidance;
-        Log log = getLog();
+        ClassLoader loader; // 类加载器，用于加载测试类
+        MutationGuidance guidance; // 模糊测试的引导策略（使用突变引导）
+        Log log = getLog(); // 获取 Maven 日志对象
         PrintStream out = log.isDebugEnabled() ? System.out : null;
-        Result result;
-
+        Result result; // 测试结果对象
+// 解析模糊测试的时间限制
         Duration duration = null;
         if (time != null && !time.isEmpty()) {
             try {
@@ -187,7 +197,7 @@ public class DiffGoal extends AbstractMojo {
                 throw new MojoExecutionException("Invalid time duration: " + time);
             }
         }
-
+        // 设置输出目录
         if (outputDirectory == null || outputDirectory.isEmpty()) {
             outputDirectory = "fuzz-results" + File.separator + testClassName + File.separator + testMethod;
         }
@@ -195,7 +205,7 @@ public class DiffGoal extends AbstractMojo {
         if(targetIncludes == null) {
             targetIncludes = "";
         }
-
+        // 解析优化级别
         OptLevel ol;
         try {
             ol = OptLevel.valueOf(optLevel.toUpperCase());
@@ -203,28 +213,38 @@ public class DiffGoal extends AbstractMojo {
             throw new MojoExecutionException("Invalid Mutation OptLevel!");
         }
 
-        // Set filters to default value of empty string
+        // Set filters to default value of empty string 设置过滤器
         if (filters == null){
             filters = "";
         }
 
         try {
+            // 获取项目的测试类路径
             List<String> classpathElements = project.getTestClasspathElements();
+            // 将类路径字符串转换为 URL 数组
             URL[] classPath = stringsToUrls(classpathElements.toArray(new String[0]));
+            // 获取当前类的类加载器作为基础类加载器
             ClassLoader baseClassLoader = getClass().getClassLoader();
+            // 构造目标名称：类名#方法名
             String targetName = testClassName + "#" + testMethod;
+            // 初始化随机数生成器（如果指定了种子则使用，否则随机生成）
             Random rnd = randomSeed != null ? new Random(randomSeed) : new Random();
+            // 设置种子文件目录（用于初始测试用例）
             File seedsDir = inputDirectory == null ? null : new File(inputDirectory);
+            // 设置结果输出目录（基于 Maven 项目的 target 目录）
             File resultsDir = new File(target, outputDirectory);
 
-            //assume MutationGuidance for the moment
+            //assume MutationGuidance for the moment 突变引导式模糊测试的特殊处理
             if (includes == null) {
                 throw new MojoExecutionException("Mutation-based fuzzing requires `-Dincludes`");
             }
+            // 创建突变类加载器，用于在运行时修改字节码
             MutationClassLoaders mcl = new MutationClassLoaders(classPath, includes, targetIncludes, ol, baseClassLoader);
+            // 获取制图（cartography）类加载器
             loader = mcl.getCartographyClassLoader();
+            // 创建突变引导策略对象
             guidance = new MutationGuidance(targetName, mcl, duration, trials, resultsDir, seedsDir, rnd);
-            // Parse string of filters for list of MutantFilters and add to guidance
+            // Parse string of filters for list of MutantFilters and add to guidance 解析过滤器字符串并添加到引导策略中
             guidance.addFilters(parseFilters(filters, guidance));
         } catch (DependencyResolutionRequiredException | MalformedURLException e) {
             throw new MojoExecutionException("Could not get project classpath", e);
@@ -233,7 +253,7 @@ public class DiffGoal extends AbstractMojo {
         } catch (IOException e) {
             throw new MojoExecutionException("I/O error", e);
         }
-
+        // 执行模糊测试
         try {
             result = GuidedFuzzing.run(testClassName, testMethod, loader, guidance, out);
         } catch (ClassNotFoundException e) {

@@ -27,25 +27,25 @@ import java.util.function.BiConsumer;
  * to avoid the problem of the generator type registry not updating for each ClassLoader
  */
 public class DiffMutationReproGuidance extends DiffFuzzReproGuidance {
-    public List<Outcome> cclOutcomes;
+    public List<Outcome> cclOutcomes; //原始程序执行结果列表
 
     /**
      *  mutation analysis results for each MutationInstance
      * paired with the index of the outcome that killed the mutant
      */
 
-    private final MutationClassLoaders MCLs;
-    private int ind;
+    private final MutationClassLoaders MCLs; // 变异类加载器集合
+    private int ind; //当前输入序号
 
     /**
      * The mutants killed so far
      */
-    public final ArraySet deadMutants = new ArraySet();
+    public final ArraySet deadMutants = new ArraySet(); // 已杀死的变异体集合
 
     /**
      * Current optimization level
      */
-    private final OptLevel optLevel;
+    private final OptLevel optLevel; // 优化级别 用于PIE模型
 
     /**
      * The set of mutants to execute for a given trial.
@@ -56,7 +56,7 @@ public class DiffMutationReproGuidance extends DiffFuzzReproGuidance {
      *
      * This set must be reset/cleared before execution of every new input.
      */
-    private static ArraySet runMutants = new ArraySet();
+    private static ArraySet runMutants = new ArraySet(); // 当前输入需要执行的变异体集合
     private static Object infectedValue;
     private static boolean infectedValueStored;
 
@@ -75,18 +75,21 @@ public class DiffMutationReproGuidance extends DiffFuzzReproGuidance {
     @Override
     public void run(TestClass testClass, FrameworkMethod method, Object[] args) throws Throwable {
         runMutants.reset();
+        // 设置变异执行回调，记录哪些变异体被执行
         MutationSnoop.setMutantExecutionCallback(m -> runMutants.add(m.id));
+        // 设置感染回调，检测值是否被感染
         BiConsumer<MutationInstance, Object> infectionCallback = (m, value) -> {
             if (!infectedValueStored) {
                 infectedValue = value;
                 infectedValueStored = true;
             } else {
+                // 比较原始值和变异值
                 if (infectedValue == null) {
                     if (value != null) {
-                        runMutants.add(m.id);
+                        runMutants.add(m.id); // 值被改变，需要执行
                     }
                 } else if (!infectedValue.equals(value)) {
-                    runMutants.add(m.id);
+                    runMutants.add(m.id); // 值被改变，需要执行
                 }
                 infectedValueStored = false;
             }
@@ -98,7 +101,7 @@ public class DiffMutationReproGuidance extends DiffFuzzReproGuidance {
 
         ind++;
 
-        // run CCL
+        // run CCL 使用原始类加载器执行原始程序
         try {
             super.run(testClass, method, args);
         } catch(InstrumentationException e) {
@@ -122,15 +125,16 @@ public class DiffMutationReproGuidance extends DiffFuzzReproGuidance {
             if (deadMutants.contains(mutationInstance.id)) {
                 continue;
             }
+            // 如果启用优化，只执行相关变异体
             if (optLevel != OptLevel.NONE  &&
                     !runMutants.contains(mutationInstance.id)) {
                 continue;
             }
-
+            // 准备变异执行信息
             MutationRunInfo mri = new MutationRunInfo(MCLs, mutationInstance, testClass, argBytes, args, method);
             mutationInstance.resetTimer();
 
-            // run with MCL
+            // run with MCL 执行变异程序
             System.out.println("Running Mutant " + mutationInstance);
             try (PrintWriter pw = new PrintWriter(new FileOutputStream(reportFile, true))) {
                 pw.printf("Running Mutant %s\n", mutationInstance.toString());
@@ -139,6 +143,7 @@ public class DiffMutationReproGuidance extends DiffFuzzReproGuidance {
             try {
                 super.run(new TestClass(mri.clazz), mri.method, mri.args);
             } catch (DiffException e) {
+                // 变异体被杀死
                 deadMutants.add(mutationInstance.id);
                 System.out.println("FAILURE: killed by input " + ind + ": " + e);
                 try (PrintWriter pw = new PrintWriter(new FileOutputStream(reportFile, true))) {

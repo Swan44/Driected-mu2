@@ -13,6 +13,7 @@ import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
+import java.util.IdentityHashMap;
 
 /**
  * A {@link ClassVisitor} which collects
@@ -100,6 +101,23 @@ public class Cartographer extends ClassVisitor {
   public MethodVisitor visitMethod(int access, String name, String descriptor, String signature,
       String[] exceptions) {
     return new MethodVisitor(API, cv.visitMethod(access, name, descriptor, signature, exceptions)) {
+
+      // ---- Propagation tracing: methodId + label numbering ----
+      final String mName = name;
+      final String mDesc = descriptor;
+      final int methodId = (Cartographer.this.className + "#" + mName + mDesc).hashCode();
+
+      final IdentityHashMap<Label, Integer> labelIds = new IdentityHashMap<>();
+      int nextLabelId = 1;
+
+      private int getLabelId(Label l) {
+        Integer id = labelIds.get(l);
+        if (id == null) {
+          id = nextLabelId++;
+          labelIds.put(l, id);
+        }
+        return id;
+      }
 
       private void dup(Type operandType, int numArgs) {
         if (operandType.getSize() == 1) {
@@ -191,7 +209,8 @@ public class Cartographer extends ClassVisitor {
        *
        * @param mut The mutator to be logged
        */
-      private void logMutOp(Mutator mut) {
+      // 修改为返回mi.id
+      private int logMutOp(Mutator mut) {
         List<MutationInstance> ops = opportunities.get(mut);
         MutationInstance mi = new MutationInstance(Cartographer.this.className, mut, ops.size(), lineNum, fileName);
         ops.add(mi);
@@ -203,7 +222,7 @@ public class Cartographer extends ClassVisitor {
               "logMutant",
               "(I)V",
               false);
-          return;
+          return mi.id;
         }
 
         if (optLevel == OptLevel.INFECTION) {
@@ -233,6 +252,23 @@ public class Cartographer extends ClassVisitor {
             logInfectionValue(mut, mi.id, operandType, numArgs, true);
           }
         }
+        return mi.id;
+      }
+
+      // Return ids of mutants whose opportunity matches this instruction
+      private int[] checkAndLog(int opcode, String desc) {
+        ArrayList<Integer> hitIds = null;
+        for (Mutator m : Mutator.allMutators) {
+          if (m.isOpportunity(opcode, desc)) {
+            int miId = logMutOp(m);
+            if (hitIds == null) hitIds = new ArrayList<>(2);
+            hitIds.add(miId);
+          }
+        }
+        if (hitIds == null) return new int[0];
+        int[] ids = new int[hitIds.size()];
+        for (int i = 0; i < ids.length; i++) ids[i] = hitIds.get(i);
+        return ids;
       }
 
       /**
@@ -267,35 +303,121 @@ public class Cartographer extends ClassVisitor {
         super.visitLineNumber(line, start);
       }
 
+      // ---- propagation: label hit ----
+      @Override
+      public void visitLabel(Label label) {
+        super.visitLabel(label);
+        int lid = getLabelId(label);
+
+        super.visitLdcInsn(methodId);
+        super.visitLdcInsn(lid);
+        super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                Type.getInternalName(PropagationTracer.class),
+                "hitLabel",
+                "(II)V",
+                false);
+      }
+
+      // ---- instruction visitors: after-instruction maybeStartAfterInsn ----
       @Override
       public void visitJumpInsn(int opcode, Label label) {
-        check(opcode);
+        //check(opcode);
+        int[] ids = checkAndLog(opcode, descriptor);
         super.visitJumpInsn(opcode, label);
+        for (int id : ids) {
+          super.visitLdcInsn(id);
+          super.visitLdcInsn(methodId);
+          super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                  Type.getInternalName(PropagationTracer.class),
+                  "maybeStartAfterInsn",
+                  "(II)V",
+                  false);
+        }
       }
 
       @Override
       public void visitLdcInsn(Object value) {
-        check(Opcodes.LDC);
+        //check(Opcodes.LDC);
+        int[] ids = checkAndLog(Opcodes.LDC, descriptor);
         super.visitLdcInsn(value);
+        for (int id : ids) {
+          super.visitLdcInsn(id);
+          super.visitLdcInsn(methodId);
+          super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                  Type.getInternalName(PropagationTracer.class),
+                  "maybeStartAfterInsn",
+                  "(II)V",
+                  false);
+        }
       }
 
       @Override
       public void visitIincInsn(int var, int inc) {
-        check(Opcodes.IINC);
+        //check(Opcodes.IINC);
+        int[] ids = checkAndLog(Opcodes.IINC, descriptor);
         super.visitIincInsn(var, inc);
+        for (int id : ids) {
+          super.visitLdcInsn(id);
+          super.visitLdcInsn(methodId);
+          super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                  Type.getInternalName(PropagationTracer.class),
+                  "maybeStartAfterInsn",
+                  "(II)V",
+                  false);
+        }
       }
 
       @Override
       public void visitMethodInsn(int opcode, String owner, String name, String descriptor,
           boolean isInterface) {
-        check(opcode, descriptor);
+        //check(opcode, descriptor);
+        int[] ids = checkAndLog(opcode, descriptor);
         super.visitMethodInsn(opcode, owner, name, descriptor, isInterface);
+        for (int id : ids) {
+          super.visitLdcInsn(id);
+          super.visitLdcInsn(methodId);
+          super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                  Type.getInternalName(PropagationTracer.class),
+                  "maybeStartAfterInsn",
+                  "(II)V",
+                  false);
+        }
       }
 
       @Override
       public void visitInsn(int opcode) {
-        check(opcode);
+        int[] ids = checkAndLog(opcode, descriptor);
+        //check(opcode);
         super.visitInsn(opcode);
+        for (int id : ids) {
+          super.visitLdcInsn(id);
+          super.visitLdcInsn(methodId);
+          super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                  Type.getInternalName(PropagationTracer.class),
+                  "maybeStartAfterInsn",
+                  "(II)V",
+                  false);
+        }
+
+        // method exit: end trace if active
+        switch (opcode) {
+          case Opcodes.IRETURN:
+          case Opcodes.LRETURN:
+          case Opcodes.FRETURN:
+          case Opcodes.DRETURN:
+          case Opcodes.ARETURN:
+          case Opcodes.RETURN:
+          case Opcodes.ATHROW:
+            super.visitLdcInsn(methodId);
+            super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                    Type.getInternalName(PropagationTracer.class),
+                    "endIfActive",
+                    "(I)V",
+                    false);
+            break;
+          default:
+            break;
+        }
       }
     };
   }

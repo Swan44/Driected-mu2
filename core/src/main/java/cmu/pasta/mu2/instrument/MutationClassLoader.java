@@ -17,6 +17,7 @@ import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
+import java.util.IdentityHashMap;
 
 /**
  * Classloader that loads test classes and performs exactly one mutation.
@@ -60,17 +61,41 @@ public class MutationClassLoader extends URLClassLoader {
               ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
       cr.accept(new ClassVisitor(Mutator.cvArg, cw) {
         @Override
-        public MethodVisitor visitMethod(int access, String name, String signature,
-                                         String superName,
-                                         String[] interfaces) {
+        public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                         String signature,
+                                         String[] exceptions) {
           return new MethodVisitor(Mutator.cvArg,
-                  cv.visitMethod(access, name, signature, superName, interfaces)) {
+                  cv.visitMethod(access, name, descriptor, signature, exceptions)) {
             final Set<Label> visitedLabels = new HashSet<>();
+
+            // methodId must match Cartographer: (class#name+desc).hashCode()
+            final String mName = name;
+            final String mDesc = descriptor;
+            final int methodId = (findingClass + "#" + mName + mDesc).hashCode();
+
+            final IdentityHashMap<Label, Integer> labelIds = new IdentityHashMap<>();
+            int nextLabelId = 1;
+            private int getLabelId(Label l) {
+              Integer id = labelIds.get(l);
+              if (id == null) {
+                id = nextLabelId++;
+                labelIds.put(l, id);
+              }
+              return id;
+            }
 
             @Override
             public void visitLabel(Label label) {
               visitedLabels.add(label);
               super.visitLabel(label);
+              int lid = getLabelId(label);
+              super.visitLdcInsn(methodId);
+              super.visitLdcInsn(lid);
+              super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                      Type.getInternalName(PropagationTracer.class),
+                      "hitLabel",
+                      "(II)V",
+                      false);
             }
 
             @Override
@@ -85,12 +110,21 @@ public class MutationClassLoader extends URLClassLoader {
 
               // Increment offset if the mutator matches
               if (findingClass.equals(mutationInstance.className)
-                      && mutationInstance.mutator.isOpportunity(opcode, signature)
+                      && mutationInstance.mutator.isOpportunity(opcode, descriptor)
                       && found.getAndIncrement() == mutationInstance.sequenceIdx) {
                 // Mutator and offset match, so perform mutation
                 for (InstructionCall ic : mutationInstance.mutator.replaceWith()) {
                   ic.call(mv, label);
                 }
+
+                // start trace right AFTER replacement
+                super.visitLdcInsn(mutationInstance.id);
+                super.visitLdcInsn(methodId);
+                super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                        Type.getInternalName(PropagationTracer.class),
+                        "forceStart",
+                        "(II)V",
+                        false);
               } else {
                 // No mutation
                 super.visitJumpInsn(opcode, label);
@@ -101,12 +135,19 @@ public class MutationClassLoader extends URLClassLoader {
             public void visitLdcInsn(Object value) {
               // Increment offset if the mutator matches
               if (findingClass.equals(mutationInstance.className)
-                      && mutationInstance.mutator.isOpportunity(Opcodes.LDC, signature)
+                      && mutationInstance.mutator.isOpportunity(Opcodes.LDC, descriptor)
                       && found.getAndIncrement() == mutationInstance.sequenceIdx) {
                 // Mutator and offset match, so perform mutation
                 for (InstructionCall ic : mutationInstance.mutator.replaceWith()) {
                   ic.call(mv, null);
                 }
+                super.visitLdcInsn(mutationInstance.id);
+                super.visitLdcInsn(methodId);
+                super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                        Type.getInternalName(PropagationTracer.class),
+                        "forceStart",
+                        "(II)V",
+                        false);
               } else {
                 // No mutation
                 super.visitLdcInsn(value);
@@ -117,10 +158,17 @@ public class MutationClassLoader extends URLClassLoader {
             public void visitIincInsn(int var, int increment) {
               // Increment offset if the mutator matches
               if (findingClass.equals(mutationInstance.className)
-                      && mutationInstance.mutator.isOpportunity(Opcodes.IINC, signature)
+                      && mutationInstance.mutator.isOpportunity(Opcodes.IINC, descriptor)
                       && found.getAndIncrement() == mutationInstance.sequenceIdx) {
                 // Mutator and offset match, so perform mutation
                 super.visitIincInsn(var, -increment); // TODO: Why is this hardcoded?
+                super.visitLdcInsn(mutationInstance.id);
+                super.visitLdcInsn(methodId);
+                super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                        Type.getInternalName(PropagationTracer.class),
+                        "forceStart",
+                        "(II)V",
+                        false);
               } else {
                 // No mutation
                 super.visitIincInsn(var, increment);
@@ -138,6 +186,13 @@ public class MutationClassLoader extends URLClassLoader {
                 for (InstructionCall ic : mutationInstance.mutator.replaceWith()) {
                   ic.call(mv, null);
                 }
+                super.visitLdcInsn(mutationInstance.id);
+                super.visitLdcInsn(methodId);
+                super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                        Type.getInternalName(PropagationTracer.class),
+                        "forceStart",
+                        "(II)V",
+                        false);
               } else {
                 // No mutation
                 super.visitMethodInsn(opcode, owner, name, descriptor, isInterface);
@@ -148,15 +203,41 @@ public class MutationClassLoader extends URLClassLoader {
             public void visitInsn(int opcode) {
               // Increment offset if the mutator matches
               if (findingClass.equals(mutationInstance.className)
-                      && mutationInstance.mutator.isOpportunity(opcode, signature)
+                      && mutationInstance.mutator.isOpportunity(opcode, descriptor)
                       && found.getAndIncrement() == mutationInstance.sequenceIdx) {
                 // Mutator and offset match, so perform mutation
                 for (InstructionCall ic : mutationInstance.mutator.replaceWith()) {
                   ic.call(mv, null);
                 }
+                super.visitLdcInsn(mutationInstance.id);
+                super.visitLdcInsn(methodId);
+                super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                        Type.getInternalName(PropagationTracer.class),
+                        "forceStart",
+                        "(II)V",
+                        false);
               } else {
                 // No mutation
                 super.visitInsn(opcode);
+              }
+              // method exit: end trace if active
+              switch (opcode) {
+                case Opcodes.IRETURN:
+                case Opcodes.LRETURN:
+                case Opcodes.FRETURN:
+                case Opcodes.DRETURN:
+                case Opcodes.ARETURN:
+                case Opcodes.RETURN:
+                case Opcodes.ATHROW:
+                  super.visitLdcInsn(methodId);
+                  super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                          Type.getInternalName(PropagationTracer.class),
+                          "endIfActive",
+                          "(I)V",
+                          false);
+                  break;
+                default:
+                  break;
               }
             }
           };
