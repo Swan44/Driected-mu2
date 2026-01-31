@@ -6,12 +6,10 @@ import java.util.Map;
 
 /**
  * Runtime tracer used by ASM-inserted hooks.
- *
  * Design goals:
  * - extremely low overhead when disabled (fast checks)
  * - no CFG build; only label hits are recorded
  * - trace window: after mutation point, within the current method only
- *
  * Notes:
  * - For original program (CCL) enable ONE mutant id per rerun (setEnabledSingle),
  *   and Cartographer-instrumented code calls maybeStartAfterInsn(id, methodId).
@@ -90,7 +88,6 @@ public final class PropagationTracer {
     /**
      * Start tracing after the mutation point for ORIGINAL program.
      * Inserted after the original instruction.
-     *
      * IMPORTANT: This implementation does NOT support tracing multiple mutants in one CCL rerun.
      * Use setEnabledSingle(id) and rerun CCL per id.
      */

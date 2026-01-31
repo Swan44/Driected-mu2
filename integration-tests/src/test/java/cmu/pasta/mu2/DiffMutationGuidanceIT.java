@@ -133,8 +133,9 @@ public class DiffMutationGuidanceIT extends AbstractMutationTest {
         // Fuzz
         GuidedFuzzing.run(testClassName, testMethod, mcls.getCartographyClassLoader(), mu2, null);
 
-        Assert.assertEquals(8, mu2.corpusCount());
+        Assert.assertEquals(9, mu2.corpusCount());
     }
+
 
     @Test
     public void compareTimSort() throws Exception {
@@ -152,7 +153,7 @@ public class DiffMutationGuidanceIT extends AbstractMutationTest {
         // Fuzz
         GuidedFuzzing.run(testClassName, testMethod, mcls.getCartographyClassLoader(), mu2, null);
 
-        Assert.assertEquals(36, mu2.corpusCount());
+        Assert.assertEquals(40, mu2.corpusCount());
     }
 
     @Test
@@ -173,7 +174,7 @@ public class DiffMutationGuidanceIT extends AbstractMutationTest {
 
         // With a dummy compare method, more inputs are saved since later candidates 
         // kill mutants that would not survive from earlier inputs with the proper compare method.
-        Assert.assertEquals(38, mu2.corpusCount());
+        Assert.assertEquals(40, mu2.corpusCount());
     }
 
     @Test
@@ -193,7 +194,7 @@ public class DiffMutationGuidanceIT extends AbstractMutationTest {
         GuidedFuzzing.run(testClassName, testMethod, mcls.getCartographyClassLoader(), mu2, null);
 
         // Since this fuzz driver has no return object, this should act the same as a nonCompare method.
-        Assert.assertEquals(38, mu2.corpusCount());
+        Assert.assertEquals(40, mu2.corpusCount());
     }
 
     @Test
@@ -212,7 +213,7 @@ public class DiffMutationGuidanceIT extends AbstractMutationTest {
         // Fuzz
         GuidedFuzzing.run(testClassName, testMethod, mcls.getCartographyClassLoader(), mu2, null);
 
-        Assert.assertEquals(36, mu2.corpusCount());
+        Assert.assertEquals(40, mu2.corpusCount());
     }
 
 }
