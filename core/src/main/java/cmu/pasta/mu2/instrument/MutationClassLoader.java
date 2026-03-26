@@ -112,65 +112,70 @@ public class MutationClassLoader extends URLClassLoader {
               if (findingClass.equals(mutationInstance.className)
                       && mutationInstance.mutator.isOpportunity(opcode, descriptor)
                       && found.getAndIncrement() == mutationInstance.sequenceIdx) {
-                // Mutator and offset match, so perform mutation
-                for (InstructionCall ic : mutationInstance.mutator.replaceWith()) {
-                  ic.call(mv, label);
-                }
 
-                // start trace right AFTER replacement
+                // 先启动 trace：表示“从这个 mutation point 开始”
                 super.visitLdcInsn(mutationInstance.id);
                 super.visitLdcInsn(methodId);
                 super.visitMethodInsn(Opcodes.INVOKESTATIC,
                         Type.getInternalName(PropagationTracer.class),
-                        "forceStart",
+                        "startAtMutationPoint",
                         "(II)V",
                         false);
+
+                // 再执行 mutation replacement
+                for (InstructionCall ic : mutationInstance.mutator.replaceWith()) {
+                  ic.call(mv, label);
+                }
+
               } else {
-                // No mutation
+                // No mutation: emit original jump
                 super.visitJumpInsn(opcode, label);
               }
             }
 
             @Override
             public void visitLdcInsn(Object value) {
-              // Increment offset if the mutator matches
               if (findingClass.equals(mutationInstance.className)
                       && mutationInstance.mutator.isOpportunity(Opcodes.LDC, descriptor)
                       && found.getAndIncrement() == mutationInstance.sequenceIdx) {
-                // Mutator and offset match, so perform mutation
-                for (InstructionCall ic : mutationInstance.mutator.replaceWith()) {
-                  ic.call(mv, null);
-                }
+
+                // 先启动
                 super.visitLdcInsn(mutationInstance.id);
                 super.visitLdcInsn(methodId);
                 super.visitMethodInsn(Opcodes.INVOKESTATIC,
                         Type.getInternalName(PropagationTracer.class),
-                        "forceStart",
+                        "startAtMutationPoint",
                         "(II)V",
                         false);
+
+                // 再执行替换
+                for (InstructionCall ic : mutationInstance.mutator.replaceWith()) {
+                  ic.call(super.mv, null);
+                }
               } else {
-                // No mutation
+                // 原始指令
                 super.visitLdcInsn(value);
               }
             }
 
             @Override
             public void visitIincInsn(int var, int increment) {
-              // Increment offset if the mutator matches
               if (findingClass.equals(mutationInstance.className)
                       && mutationInstance.mutator.isOpportunity(Opcodes.IINC, descriptor)
                       && found.getAndIncrement() == mutationInstance.sequenceIdx) {
-                // Mutator and offset match, so perform mutation
-                super.visitIincInsn(var, -increment); // TODO: Why is this hardcoded?
+
+                // 先启动
                 super.visitLdcInsn(mutationInstance.id);
                 super.visitLdcInsn(methodId);
                 super.visitMethodInsn(Opcodes.INVOKESTATIC,
                         Type.getInternalName(PropagationTracer.class),
-                        "forceStart",
+                        "startAtMutationPoint",
                         "(II)V",
                         false);
+
+                // 再执行变异后的 iinc
+                super.visitIincInsn(var, -increment); // 这里只是沿用你原来的逻辑
               } else {
-                // No mutation
                 super.visitIincInsn(var, increment);
               }
             }
@@ -178,49 +183,71 @@ public class MutationClassLoader extends URLClassLoader {
             @Override
             public void visitMethodInsn(int opcode, String owner, String name, String descriptor,
                                         boolean isInterface) {
-              // Increment offset if the mutator matches
               if (findingClass.equals(mutationInstance.className)
                       && mutationInstance.mutator.isOpportunity(opcode, descriptor)
                       && found.getAndIncrement() == mutationInstance.sequenceIdx) {
-                // Mutator and offset match, so perform mutation
-                for (InstructionCall ic : mutationInstance.mutator.replaceWith()) {
-                  ic.call(mv, null);
-                }
+
+                // 先启动
                 super.visitLdcInsn(mutationInstance.id);
                 super.visitLdcInsn(methodId);
                 super.visitMethodInsn(Opcodes.INVOKESTATIC,
                         Type.getInternalName(PropagationTracer.class),
-                        "forceStart",
+                        "startAtMutationPoint",
                         "(II)V",
                         false);
+
+                // 再执行替换
+                for (InstructionCall ic : mutationInstance.mutator.replaceWith()) {
+                  ic.call(super.mv, null);
+                }
               } else {
-                // No mutation
                 super.visitMethodInsn(opcode, owner, name, descriptor, isInterface);
               }
             }
 
             @Override
             public void visitInsn(int opcode) {
-              // Increment offset if the mutator matches
-              if (findingClass.equals(mutationInstance.className)
-                      && mutationInstance.mutator.isOpportunity(opcode, descriptor)
-                      && found.getAndIncrement() == mutationInstance.sequenceIdx) {
-                // Mutator and offset match, so perform mutation
-                for (InstructionCall ic : mutationInstance.mutator.replaceWith()) {
-                  ic.call(mv, null);
-                }
+              boolean matched =
+                      findingClass.equals(mutationInstance.className) &&
+                              mutationInstance.mutator.isOpportunity(opcode, descriptor) &&
+                              found.getAndIncrement() == mutationInstance.sequenceIdx;
+
+              if (matched) {
                 super.visitLdcInsn(mutationInstance.id);
                 super.visitLdcInsn(methodId);
                 super.visitMethodInsn(Opcodes.INVOKESTATIC,
                         Type.getInternalName(PropagationTracer.class),
-                        "forceStart",
+                        "startAtMutationPoint",
                         "(II)V",
                         false);
+
+                for (InstructionCall ic : mutationInstance.mutator.replaceWith()) {
+                  ic.call(mv, null);
+                }
               } else {
-                // No mutation
-                super.visitInsn(opcode);
+                // return/throw 之前先 finalize
+                switch (opcode) {
+                  case Opcodes.IRETURN:
+                  case Opcodes.LRETURN:
+                  case Opcodes.FRETURN:
+                  case Opcodes.DRETURN:
+                  case Opcodes.ARETURN:
+                  case Opcodes.RETURN:
+                  case Opcodes.ATHROW:
+                    super.visitLdcInsn(methodId);
+                    super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                            Type.getInternalName(PropagationTracer.class),
+                            "endIfActive",
+                            "(I)V",
+                            false);
+                    super.visitInsn(opcode);
+                    return;
+                  default:
+                    super.visitInsn(opcode);
+                }
               }
-              // method exit: end trace if active
+
+              // 如果 mutation replacement 自己没有 return/throw，这里仅对原 opcode 是 return/throw 的情况做兜底
               switch (opcode) {
                 case Opcodes.IRETURN:
                 case Opcodes.LRETURN:

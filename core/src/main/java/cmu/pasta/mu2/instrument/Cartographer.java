@@ -321,85 +321,91 @@ public class Cartographer extends ClassVisitor {
       // ---- instruction visitors: after-instruction maybeStartAfterInsn ----
       @Override
       public void visitJumpInsn(int opcode, Label label) {
-        //check(opcode);
         int[] ids = checkAndLog(opcode, descriptor);
-        super.visitJumpInsn(opcode, label);
+
         for (int id : ids) {
           super.visitLdcInsn(id);
           super.visitLdcInsn(methodId);
           super.visitMethodInsn(Opcodes.INVOKESTATIC,
                   Type.getInternalName(PropagationTracer.class),
-                  "maybeStartAfterInsn",
+                  "startAtMutationPoint",
                   "(II)V",
                   false);
         }
+
+        super.visitJumpInsn(opcode, label);
       }
 
       @Override
       public void visitLdcInsn(Object value) {
-        //check(Opcodes.LDC);
         int[] ids = checkAndLog(Opcodes.LDC, descriptor);
-        super.visitLdcInsn(value);
+
+        // 先启动，再执行原始指令
         for (int id : ids) {
           super.visitLdcInsn(id);
           super.visitLdcInsn(methodId);
           super.visitMethodInsn(Opcodes.INVOKESTATIC,
                   Type.getInternalName(PropagationTracer.class),
-                  "maybeStartAfterInsn",
+                  "startAtMutationPoint",
                   "(II)V",
                   false);
         }
+
+        super.visitLdcInsn(value);
       }
 
       @Override
       public void visitIincInsn(int var, int inc) {
-        //check(Opcodes.IINC);
         int[] ids = checkAndLog(Opcodes.IINC, descriptor);
-        super.visitIincInsn(var, inc);
+
+        // 先启动，再执行原始指令
         for (int id : ids) {
           super.visitLdcInsn(id);
           super.visitLdcInsn(methodId);
           super.visitMethodInsn(Opcodes.INVOKESTATIC,
                   Type.getInternalName(PropagationTracer.class),
-                  "maybeStartAfterInsn",
+                  "startAtMutationPoint",
                   "(II)V",
                   false);
         }
+
+        super.visitIincInsn(var, inc);
       }
 
       @Override
       public void visitMethodInsn(int opcode, String owner, String name, String descriptor,
-          boolean isInterface) {
-        //check(opcode, descriptor);
+                                  boolean isInterface) {
         int[] ids = checkAndLog(opcode, descriptor);
-        super.visitMethodInsn(opcode, owner, name, descriptor, isInterface);
+
+        // 先启动，再执行原始调用
         for (int id : ids) {
           super.visitLdcInsn(id);
           super.visitLdcInsn(methodId);
           super.visitMethodInsn(Opcodes.INVOKESTATIC,
                   Type.getInternalName(PropagationTracer.class),
-                  "maybeStartAfterInsn",
+                  "startAtMutationPoint",
                   "(II)V",
                   false);
         }
+
+        super.visitMethodInsn(opcode, owner, name, descriptor, isInterface);
       }
 
       @Override
       public void visitInsn(int opcode) {
         int[] ids = checkAndLog(opcode, descriptor);
-        //check(opcode);
-        super.visitInsn(opcode);
+
+        // 先启动，再执行该指令
         for (int id : ids) {
           super.visitLdcInsn(id);
           super.visitLdcInsn(methodId);
           super.visitMethodInsn(Opcodes.INVOKESTATIC,
                   Type.getInternalName(PropagationTracer.class),
-                  "maybeStartAfterInsn",
+                  "startAtMutationPoint",
                   "(II)V",
                   false);
         }
 
-        // method exit: end trace if active
         switch (opcode) {
           case Opcodes.IRETURN:
           case Opcodes.LRETURN:
@@ -408,14 +414,18 @@ public class Cartographer extends ClassVisitor {
           case Opcodes.ARETURN:
           case Opcodes.RETURN:
           case Opcodes.ATHROW:
+            // return/throw 前先结束 trace
             super.visitLdcInsn(methodId);
             super.visitMethodInsn(Opcodes.INVOKESTATIC,
                     Type.getInternalName(PropagationTracer.class),
                     "endIfActive",
                     "(I)V",
                     false);
+            super.visitInsn(opcode);
             break;
+
           default:
+            super.visitInsn(opcode);
             break;
         }
       }

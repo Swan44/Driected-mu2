@@ -19,17 +19,30 @@ public final class PropagationTracer {
 
     private PropagationTracer() {}
 
-    /** enabled mutant ids for the current test execution (thread-local). */
     private static final ThreadLocal<int[]> ENABLED_IDS =
             ThreadLocal.withInitial(() -> new int[0]);
 
-    /** active tracing state (thread-local). */
     private static final ThreadLocal<State> STATE =
             ThreadLocal.withInitial(State::new);
 
-    /** completed signatures (thread-local map keyed by mutant id). */
     private static final ThreadLocal<Map<Integer, PropagationTraceSig>> DONE =
             ThreadLocal.withInitial(HashMap::new);
+
+    public static final class Counters {
+        public long startCalled;
+        public long startSkippedDisabled;
+        public long startSkippedActive;
+        public long startSkippedRepeated;
+        public long hitLabelCalled;
+        public long hitLabelEffective;
+        public long endCalled;
+        public long endMethodMismatch;
+        public long forceEndCalled;
+        public long sigFinalized;
+    }
+
+    private static final ThreadLocal<Counters> CNT =
+            ThreadLocal.withInitial(Counters::new);
 
     private static final class State {
         boolean active;
@@ -37,43 +50,28 @@ public final class PropagationTracer {
         int activeMethodId;
         long hash;
         int steps;
-
-        // avoid starting same mutant multiple times in same run
         int startedMutantId = Integer.MIN_VALUE;
 
-        void reset() {
+        void resetActiveOnly() {
             active = false;
             activeMutantId = 0;
             activeMethodId = 0;
             hash = 0L;
             steps = 0;
         }
-    }
 
-    // CCL 每个 seed 执行前设置
-    /** Called by guidance before running the ORIGINAL program rerun for propagation signatures. */
-    // 在“单次 CCL rerun 想同时收集多个 mutant 的 origSig”时才需要
-    public static void setEnabledMutants(int[] mutantIds) {
-        if (mutantIds == null || mutantIds.length == 0) {
-            ENABLED_IDS.set(new int[0]);
-            return;
+        void resetAll() {
+            resetActiveOnly();
+            startedMutantId = Integer.MIN_VALUE;
         }
-        int[] copy = Arrays.copyOf(mutantIds, mutantIds.length);
-        Arrays.sort(copy);
-        ENABLED_IDS.set(copy);
     }
 
-    /** Convenience: enable only a single mutant id for a mutant run / a single CCL rerun. */
-    // CCL 每次 rerun 只追 1 个 mutant
     public static void setEnabledSingle(int mutantId) {
         ENABLED_IDS.set(new int[]{mutantId});
     }
 
-    /** Clear thread-local state and signatures (call at start of each trial). */
     public static void clearAll() {
-        State s = STATE.get();
-        s.reset();
-        s.startedMutantId = Integer.MIN_VALUE;
+        STATE.get().resetAll();
         DONE.get().clear();
     }
 
@@ -83,80 +81,97 @@ public final class PropagationTracer {
         return Arrays.binarySearch(ids, mutantId) >= 0;
     }
 
-    // CCL 在机会点调用（只做 pending）
-    // CCL在变异点之后开启跟踪 并初始化路径哈希
-    /**
-     * Start tracing after the mutation point for ORIGINAL program.
-     * Inserted after the original instruction.
-     * IMPORTANT: This implementation does NOT support tracing multiple mutants in one CCL rerun.
-     * Use setEnabledSingle(id) and rerun CCL per id.
-     */
-    public static void maybeStartAfterInsn(int mutantId, int methodId) {
-        if (!isEnabled(mutantId)) return;
+    /** 统一：在 mutation opportunity 对应字节码执行前调用 */
+    public static void startAtMutationPoint(int mutantId, int methodId) {
+        Counters c = CNT.get();
+        c.startCalled++;
+
+        if (!isEnabled(mutantId)) {
+            c.startSkippedDisabled++;
+            return;
+        }
 
         State s = STATE.get();
+        if (s.active) {
+            c.startSkippedActive++;
+            return;
+        }
 
-        // If already tracing, do not override current trace (prevents losing sig)
-        // 确保CCL一次只跟踪一个变异点的路径
-        if (s.active) return;
+        if (s.startedMutantId == mutantId) {
+            c.startSkippedRepeated++;
+            return;
+        }
 
-        // Avoid repeated starts for same mutant (loops)
-        if (s.startedMutantId == mutantId) return;
-        s.startedMutantId = mutantId;
-
-        s.active = true;
-        s.activeMutantId = mutantId;
-        s.activeMethodId = methodId;
-        s.hash = mix64(0x9E3779B97F4A7C15L ^ mutantId ^ ((long) methodId << 32));
-        s.steps = 0;
-    }
-
-    // MCL 在 mutation 替换后调用（立即启动） 并初始化路径哈希
-    /** Start tracing after mutation point for MUTANT program (always). */
-    public static void forceStart(int mutantId, int methodId) {
-        State s = STATE.get();
-        // 如果已经在跟踪，就不要覆盖（避免循环内多次重置）
-        if (s.active) return;
-        // 防止同一 mutant 在同一次运行里重复启动
-        if (s.startedMutantId == mutantId) return;
         s.startedMutantId = mutantId;
         s.active = true;
         s.activeMutantId = mutantId;
         s.activeMethodId = methodId;
-        s.hash = mix64(0xD6E8FEB86659FD93L ^ mutantId ^ ((long) methodId << 32));
+
+        // 原程序和变异体必须一致
+        s.hash = mix64(0x9E3779B97F4A7C15L ^ mutantId ^ (((long) methodId) << 32));
         s.steps = 0;
     }
 
-    /** Hit a label (instrumented at visitLabel). */
     public static void hitLabel(int methodId, int labelId) {
+        Counters c = CNT.get();
+        c.hitLabelCalled++;
+
         State s = STATE.get();
         if (!s.active) return;
         if (s.activeMethodId != methodId) return;
 
-        long x = ((long) labelId << 1) ^ (labelId * 0x9E3779B9L); // 把 labelId 做简单扩展，避免 labelId 的低位模式太强。
+        c.hitLabelEffective++;
+        long x = ((long) labelId << 1) ^ (labelId * 0x9E3779B9L);
         s.hash = mix64(s.hash ^ x);
-        s.steps++; // 路径长度 作为补充信息
+        s.steps++;
     }
 
-    /** End trace at method exit (RETURN/ATHROW). */
-    // 在方法退出（RETURN/ATHROW）插桩调用。 把当前 trace 固化为 (hash, steps)，按 mutantId 存入 DONE。
     public static void endIfActive(int methodId) {
+        Counters c = CNT.get();
+        c.endCalled++;
+
         State s = STATE.get();
         if (!s.active) return;
-        if (s.activeMethodId != methodId) return;
+        if (s.activeMethodId != methodId) {
+            c.endMethodMismatch++;
+            return;
+        }
 
         DONE.get().put(s.activeMutantId, new PropagationTraceSig(s.hash, s.steps));
-        s.reset();
+        c.sigFinalized++;
+        s.resetActiveOnly();
     }
 
-    // 只读不删，适合在同一次run中多次读取
+    public static void forceEndIfActive() {
+        Counters c = CNT.get();
+        c.forceEndCalled++;
+
+        State s = STATE.get();
+        if (!s.active) return;
+
+        DONE.get().put(s.activeMutantId, new PropagationTraceSig(s.hash, s.steps));
+        c.sigFinalized++;
+        s.resetActiveOnly();
+    }
+
     public static PropagationTraceSig getSig(int mutantId) {
         return DONE.get().get(mutantId);
     }
 
-    // 读取并删除，适合“消费一次就丢”，避免 map 变大。
-    public static PropagationTraceSig popSig(int mutantId) {
-        return DONE.get().remove(mutantId);
+    public static Counters snapshotCounters() {
+        Counters src = CNT.get();
+        Counters dst = new Counters();
+        dst.startCalled = src.startCalled;
+        dst.startSkippedDisabled = src.startSkippedDisabled;
+        dst.startSkippedActive = src.startSkippedActive;
+        dst.startSkippedRepeated = src.startSkippedRepeated;
+        dst.hitLabelCalled = src.hitLabelCalled;
+        dst.hitLabelEffective = src.hitLabelEffective;
+        dst.endCalled = src.endCalled;
+        dst.endMethodMismatch = src.endMethodMismatch;
+        dst.forceEndCalled = src.forceEndCalled;
+        dst.sigFinalized = src.sigFinalized;
+        return dst;
     }
 
     private static long mix64(long z) {
