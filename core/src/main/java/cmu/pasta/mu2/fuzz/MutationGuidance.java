@@ -193,7 +193,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
   private static final double W_T    = Double.parseDouble(System.getProperty("mu2.W_T",    "0.4"));
   private static final double W_SZ   = Double.parseDouble(System.getProperty("mu2.W_SZ",   "0.2"));
 
-  // TDGF-style local reranking on top of Zest queue semantics
+  // local reranking on top of Zest queue semantics
   private static final int SELECT_WINDOW = Integer.getInteger("mu2.SELECT_WINDOW", 16);
   private static final double SELECT_COST_W = Double.parseDouble(System.getProperty("mu2.SELECT_COST_W", "0.20"));
 
@@ -1020,7 +1020,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
             numSavedInputs,
             numFavoredLastCycle,
             bestIdx,
-            "tdgf_window_select",
+            "window_select",
             bestScore,
             rho
     );
@@ -1131,7 +1131,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
             numSavedInputs,
             numFavoredLastCycle,
             currentParentInputIdx,
-            "tdgf_energy",
+            "energy",
             util,
             mult
     );
