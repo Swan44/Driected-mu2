@@ -60,6 +60,8 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
 
   public static boolean RUN_MUTANTS_IN_PARALLEL = Boolean.getBoolean("mu2.PARALLEL");
 
+  private static final boolean PROP_FORCE_END = Boolean.getBoolean("mu2.prop.forceEnd");
+
   /**
    * The mutants killed so far
    */
@@ -131,6 +133,8 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     final double score;
     final long execMillis;
     final int size;
+    final int numMutants;
+    final boolean hasSignal;
     final Map<Integer, Double> hatDists;
 
     PropMeta(double D,
@@ -138,12 +142,16 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
              double score,
              long execMillis,
              int size,
+             int numMutants,
+             boolean hasSignal,
              Map<Integer, Double> hatDists) {
       this.D = D;
       this.N = N;
       this.score = score;
       this.execMillis = execMillis;
       this.size = size;
+      this.numMutants = numMutants;
+      this.hasSignal = hasSignal;
       this.hatDists = hatDists;
     }
   }
@@ -154,23 +162,46 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
 
 
   // --- Propagation scoring parameters (tunable via system properties) ---
-  private static final int PROP_TOPK = Integer.getInteger("mu2.PROP_TOPK", 5);
-  // private static final int PROP_SAVE_K = Integer.getInteger("mu2.PROP_SAVE_K", 10);
-  private static final double PROP_SAVE_TH_D = Double.parseDouble(System.getProperty("mu2.PROP_SAVE_TH_D", "0.60"));
-  private static final double PROP_SAVE_TH_N = Double.parseDouble(System.getProperty("mu2.PROP_SAVE_TH_N", "0.05"));
-  private static final double PROP_FAV_TH_D = Double.parseDouble(System.getProperty("mu2.PROP_FAV_TH_D", "0.75"));
-  private static final double PROP_FAV_TH_N = Double.parseDouble(System.getProperty("mu2.PROP_FAV_TH_N", "0.08"));
+  private static final int PROP_TOPK = Integer.getInteger("mu2.PROP_TOPK", 3);
+  private static final int PROP_MIN_MUTANTS = Integer.getInteger("mu2.PROP_MIN_MUTANTS", 5);
 
-  // energy shaping
-  private static final double ENERGY_ALPHA = Double.parseDouble(System.getProperty("mu2.ENERGY_ALPHA", "1.0"));
-  private static final double ENERGY_BETA  = Double.parseDouble(System.getProperty("mu2.ENERGY_BETA",  "2.0"));
-  private static final int ENERGY_CHILD_MAX = Integer.getInteger("mu2.ENERGY_CHILD_MAX", 5000);
+  // rescue-save gate: only allow a small number of strong propagation-only seeds into corpus
+  private static final double PROP_RESCUE_TH_D = Double.parseDouble(System.getProperty("mu2.PROP_RESCUE_TH_D", "0.72"));
+  private static final double PROP_RESCUE_TH_N = Double.parseDouble(System.getProperty("mu2.PROP_RESCUE_TH_N", "0.06"));
+
+  // propagation-based favored gate should be stricter than save gate
+  private static final double PROP_FAV_STRONG_D = Double.parseDouble(System.getProperty("mu2.PROP_FAV_STRONG_D", "0.78"));
+  private static final double PROP_FAV_STRONG_N = Double.parseDouble(System.getProperty("mu2.PROP_FAV_STRONG_N", "0.04"));
+  private static final double PROP_FAV_N_ONLY   = Double.parseDouble(System.getProperty("mu2.PROP_FAV_N_ONLY",   "0.08"));
+
+  // propagation measurements that are too slow should not gain bonus
+  private static final long PROP_MAX_EXEC_MS = Long.getLong("mu2.PROP_MAX_EXEC_MS", 50L);
+
+  // novelty gate: only gains above bestDist + eps count as real novelty
+  private static final double NOVELTY_EPS = Double.parseDouble(System.getProperty("mu2.NOVELTY_EPS", "0.03"));
+
+  // energy shaping (small bounded bonus instead of aggressive multiplicative explosion)
+  private static final double ENERGY_GAMMA = Double.parseDouble(System.getProperty("mu2.ENERGY_GAMMA", "0.35"));
+  private static final double ENERGY_MAX_MULT = Double.parseDouble(System.getProperty("mu2.ENERGY_MAX_MULT", "1.4"));
+  private static final int ENERGY_CHILD_MAX = Integer.getInteger("mu2.ENERGY_CHILD_MAX", 3000);
 
   // score weights
   private static final double W_KILL = Double.parseDouble(System.getProperty("mu2.W_KILL", "2.0"));
   private static final double W_COV  = Double.parseDouble(System.getProperty("mu2.W_COV",  "1.0"));
-  private static final double W_D    = Double.parseDouble(System.getProperty("mu2.W_D",    "1.0"));
-  private static final double W_N    = Double.parseDouble(System.getProperty("mu2.W_N",    "1.5"));
+  private static final double W_D    = Double.parseDouble(System.getProperty("mu2.W_D",    "0.8"));
+  private static final double W_N    = Double.parseDouble(System.getProperty("mu2.W_N",    "1.2"));
+  private static final double W_T    = Double.parseDouble(System.getProperty("mu2.W_T",    "0.4"));
+  private static final double W_SZ   = Double.parseDouble(System.getProperty("mu2.W_SZ",   "0.2"));
+
+  // TDGF-style local reranking on top of Zest queue semantics
+  private static final int SELECT_WINDOW = Integer.getInteger("mu2.SELECT_WINDOW", 16);
+  private static final double SELECT_COST_W = Double.parseDouble(System.getProperty("mu2.SELECT_COST_W", "0.20"));
+
+  // annealing / exploitation strength
+  private static final double SCHED_ANNEAL_K = Double.parseDouble(System.getProperty("mu2.SCHED_ANNEAL_K", "3.0"));
+
+  // energy scaling based on utility relative to average utility
+  private static final double ENERGY_COST_W = Double.parseDouble(System.getProperty("mu2.ENERGY_COST_W", "0.30"));
 
   // --- bestDist persistence ---
   private final File bestDistFile;
@@ -195,8 +226,15 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
   protected PrintWriter seedScoreLog;
 
   // === schedule / energy ===
-  protected File scheduleFile;
-  protected PrintWriter scheduleLog;
+
+  protected File scheduleDecisionFile;
+  protected PrintWriter scheduleDecisionLog;
+
+  protected File cycleSummaryFile;
+  protected PrintWriter cycleSummaryLog;
+
+  protected File propCountersFile;
+  protected PrintWriter propCountersLog;
 
   // === counters / summaries ===
   protected long numPathSigCollected = 0;
@@ -245,8 +283,8 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
 
 
   public MutationGuidance(String testName, MutationClassLoaders mutationClassLoaders,
-      Duration duration, Long trials, File outputDirectory, File seedInputDir, Random rand)
-      throws IOException {
+                          Duration duration, Long trials, File outputDirectory, File seedInputDir, Random rand)
+          throws IOException {
     super(testName, duration, trials, outputDirectory, seedInputDir, rand);
     this.mutationClassLoaders = mutationClassLoaders;
     this.totalCoverage = new MutationCoverage();
@@ -258,34 +296,53 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     loadBestDist();
     this.pathDiffFile = new File(outputDirectory, "path-diff.csv");
     this.seedScoreFile = new File(outputDirectory, "seed-score.csv");
-    this.scheduleFile = new File(outputDirectory, "schedule.csv");
+    this.scheduleDecisionFile = new File(outputDirectory, "schedule-decisions.csv");
+    this.cycleSummaryFile = new File(outputDirectory, "cycle-summary.csv");
+    this.propCountersFile = new File(outputDirectory, "prop-counters.csv");
 
     // 删除旧文件
     pathDiffFile.delete();
     seedScoreFile.delete();
-    scheduleFile.delete();
+    scheduleDecisionFile.delete();
+    cycleSummaryFile.delete();
+    propCountersFile.delete();
 
     // 写 header
     pathDiffLog = new PrintWriter(new FileWriter(pathDiffFile, true));
     pathDiffLog.println(
             "ts,trial,cycle,parentId,childId," +
                     "parentSigHash,childSigHash," +
-                    "rawDist,normDist,distToTarget,targetsSize"
+                    "rawDist,normDist,distOrigMut,targetsSize"
     );
     pathDiffLog.flush();
 
     seedScoreLog = new PrintWriter(new FileWriter(seedScoreFile, true));
     seedScoreLog.println(
-            "trial,inputId,D,N,score,numMutants,execMs,inputSize"
+            "trial,currentParentInputId,D,N,score,numMutants,execMs,inputSize"
     );
     seedScoreLog.flush();
 
-    scheduleLog = new PrintWriter(new FileWriter(scheduleFile, true));
-    scheduleLog.println(
+    cycleSummaryLog = new PrintWriter(new FileWriter(cycleSummaryFile, true));
+    cycleSummaryLog.println(
             "ts,cycle,numSaved,numFavored," +
-                    "parentIdx,reason,energy,scoreParent,pathDiffUsed"
+                    "parentIdx,reason,killedThisCycle"
     );
-    scheduleLog.flush();
+    cycleSummaryLog.flush();
+
+    scheduleDecisionLog = new PrintWriter(new FileWriter(scheduleDecisionFile, true));
+    scheduleDecisionLog.println(
+            "ts,cycle,numSaved,numFavored," +
+                    "parentIdx,reason,energy(score),pathDiffUsed"
+    );
+    scheduleDecisionLog.flush();
+
+    propCountersLog = new PrintWriter(new FileWriter(propCountersFile, true));
+    propCountersLog.println(
+            "ts,cycle,trial,startCalled,hitLabelCalled,hitLabelEffective," +
+                    "endCalled,forceEndCalled,sigFinalized,startSkippedDisabled," +
+                    "startSkippedActive,startSkippedRepeated,endMethodMismatch"
+    );
+    propCountersLog.flush();
 
     filters.add(new DeadMutantsFilter(this));
     if(optLevel != OptLevel.NONE){
@@ -324,7 +381,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
   @Override
   protected String getStatNames() {
     return super.getStatNames()
-        + ", found_muts, dead_muts, seen_muts, run_muts, total_time, map_time";
+            + ", found_muts, dead_muts, seen_muts, run_muts, total_time, map_time";
   }
 
   // 返回已满足非故障输入的保存条件的列表
@@ -337,9 +394,6 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
       currentInput.setFavored();
     }
 
-    // TODO: Add responsibilities for mutants killed
-
-    // 判断是否有新的 coverage（近似：criteria 中是否包含）
     boolean hasNewCov = false;
     for (String s : criteria) {
       if (s.equals("+cov") || s.equals("+valid") || s.equals("+count")) {
@@ -348,106 +402,58 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
       }
     }
 
-    // 计算 propagation side-channel metadata
     PropMeta meta = computePropMeta(newKilledMutants, hasNewCov);
     propMeta.put(currentInput, meta);
 
-    // 5. distance-guided saving: +prop
-    if (result == Result.SUCCESS ||
-            (result == Result.INVALID && !SAVE_ONLY_VALID)) {
+    boolean baseSaved = !criteria.isEmpty();
+    boolean allowInvalid = (result == Result.SUCCESS) || (result == Result.INVALID && !SAVE_ONLY_VALID);
 
-      if (meta.D >= PROP_SAVE_TH_D && meta.N >= PROP_SAVE_TH_N) {
-        criteria.add(String.format(
-                "+prop(D=%.3f,N=%.3f,S=%.3f)",
-                meta.D, meta.N, meta.score
-        ));
-      }
+    // If the input is already worth saving for the base guidance, only annotate it with propagation info.
+    if (baseSaved && allowInvalid && meta.hasSignal) {
+      criteria.add(String.format("+prop(D=%.3f,N=%.3f,S=%.3f)", meta.D, meta.N, meta.score));
     }
 
-    // 6. distance-guided favored（复用 Zest *20 机制）
-    if (meta.D >= PROP_FAV_TH_D || meta.N >= PROP_FAV_TH_N) {
+    // Propagation-only rescue save: be very conservative.
+    boolean allowPropRescue =
+            !baseSaved &&
+                    allowInvalid &&
+                    meta.hasSignal &&
+                    meta.numMutants >= PROP_MIN_MUTANTS &&
+                    meta.execMillis > 0 &&
+                    meta.execMillis <= PROP_MAX_EXEC_MS &&
+                    meta.D >= PROP_RESCUE_TH_D &&
+                    meta.N >= PROP_RESCUE_TH_N;
+
+    if (allowPropRescue) {
+      criteria.add(String.format("+prop(D=%.3f,N=%.3f,S=%.3f)", meta.D, meta.N, meta.score));
+    }
+
+    // Propagation-based favored should remain high-precision / low-recall.
+    boolean propFav =
+            meta.hasSignal &&
+                    meta.numMutants >= PROP_MIN_MUTANTS &&
+                    meta.execMillis > 0 &&
+                    meta.execMillis <= PROP_MAX_EXEC_MS &&
+                    ((meta.D >= PROP_FAV_STRONG_D && meta.N >= PROP_FAV_STRONG_N) ||
+                            (meta.N >= PROP_FAV_N_ONLY));
+
+    if (propFav) {
       currentInput.setFavored();
     }
 
     seedScoreLog.printf(
             "%d,%d,%.4f,%.4f,%.4f,%d,%d,%d\n",
-            numRuns,
+            numTrials,
             currentParentInputIdx,
             meta.D,
             meta.N,
             meta.score,
-            propDistances.size(),
+            meta.numMutants,
             meta.execMillis,
             currentInput.size()
     );
     seedScoreLog.flush();
     return criteria;
-  }
-
-  // 分发和执行变异体
-  /**
-   * @param instance 变异体示例
-   * @param testClass 测试类
-   * @param argBytes 参数的字节表示（用于序列化）？
-   * @param args 参数数组
-   * @param method 要执行的方法
-   * @return 执行结果 Outcome对象
-   */
-  public Outcome dispatchMutationInstance(MutationInstance instance, TestClass testClass, byte[] argBytes,
-                                          Object[] args, FrameworkMethod method)
-          throws ExecutionException, InterruptedException, InvocationTargetException, IllegalAccessException,
-          IOException, ClassNotFoundException, NoSuchMethodException {
-
-    // update info 重置变异体执行时间计时器
-    instance.resetTimer();
-    // 创建变异体运行信息对象 封装执行所需的所所有信息 使用变异类加载器、变异体示实例、测试类、参数等信息
-    MutationRunInfo mri = new MutationRunInfo(mutationClassLoaders, instance, testClass, argBytes, args, method);
-
-    // run with MCL 异步执行变异体测试
-    FutureTask<Outcome> task = new FutureTask<>(() -> {
-      try {
-        // 创建测试运行器 准备执行测试
-        TrialRunner dtr = new TrialRunner(mri.clazz, mri.method, mri.args);
-        dtr.run();
-        if (dtr.getOutput() == null) return new Outcome(null, null);
-        else {
-          // 序列化输出并返回
-          return new Outcome(Serializer.translate(dtr.getOutput(),
-                  mutationClassLoaders.getCartographyClassLoader()), null);
-        }
-      } catch (InstrumentationException e) {
-        throw new GuidanceException(e);
-      } catch (GuidanceException e) {
-        throw e;
-      } catch (Throwable e) {
-        return new Outcome(null, e);
-      }
-    });
-    Outcome mclOutcome = null;
-
-    if (RUN_MUTANTS_IN_PARALLEL) {
-
-      Thread thread = new Thread(task);
-      thread.start();
-
-      ExecutorService service = Executors.newSingleThreadExecutor();
-      Future<Outcome> outcome = service.submit(() -> task.get());
-
-      try {
-        // 设置超时等待，TIMEOUT秒内获取结果
-        mclOutcome = outcome.get(TIMEOUT, TimeUnit.SECONDS);
-      } catch (TimeoutException e) {
-        thread.stop();
-        mclOutcome = new Outcome(null, new MutationTimeoutException(TIMEOUT));
-      }
-
-      service.shutdownNow();
-    } else { // 串行 直接在当前线程执行
-      task.run();
-      mclOutcome = task.get();
-    }
-
-    return mclOutcome;
   }
 
   private static final class MutantRunResult {
@@ -462,9 +468,139 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     }
   }
 
-  // 用于 propagation 选择：只负责选 10 个“最近最少执行”的 mutant 做路径度量
-  private final KLeastExecutedFilter propKLeastExecuted = new KLeastExecutedFilter(10);
+  private static int safeDistance(PropagationTraceSig orig, PropagationTraceSig mut) {
+    if (orig == null || mut == null) return -1;
+    try {
+      return PropagationTraceSig.distance(orig, mut);
+    } catch (Throwable t) {
+      return -1;
+    }
+  }
 
+  public MutantRunResult dispatchMutationInstanceWithSig(
+          MutationInstance instance,
+          TestClass testClass,
+          byte[] argBytes,
+          Object[] args,
+          FrameworkMethod method)
+          throws InvocationTargetException, IllegalAccessException,
+          IOException, ClassNotFoundException, NoSuchMethodException {
+
+    instance.resetTimer();
+    MutationRunInfo mri = new MutationRunInfo(
+            mutationClassLoaders, instance, testClass, argBytes, args, method);
+
+    PropagationTracer.clearAll();
+    PropagationTracer.setEnabledSingle(instance.id);
+
+    Outcome out;
+    PropagationTraceSig sig = null;
+
+    try {
+      TrialRunner dtr = new TrialRunner(mri.clazz, mri.method, mri.args);
+      dtr.run();
+
+      if (dtr.getOutput() == null) {
+        out = new Outcome(null, null);
+      } else {
+        out = new Outcome(
+                Serializer.translate(dtr.getOutput(),
+                        mutationClassLoaders.getCartographyClassLoader()),
+                null
+        );
+      }
+    } catch (InstrumentationException e) {
+      throw new GuidanceException(e);
+    } catch (GuidanceException e) {
+      throw e;
+    } catch (Throwable e) {
+      out = new Outcome(null, e);
+    } finally {
+      // sig 必须在执行线程里取
+      try {
+        if (PROP_FORCE_END) {
+          PropagationTracer.forceEndIfActive();
+        }
+        sig = PropagationTracer.getSig(instance.id);
+      } catch (Throwable ignore) {
+        sig = null;
+      } finally {
+        // 防止该线程复用时残留
+        PropagationTracer.clearAll();
+      }
+    }
+
+    return new MutantRunResult(instance, out, sig);
+  }
+
+  private void enablePropagationForSelectedIds(int[] selectedIds) {
+    try {
+      Method m = PropagationTracer.class.getMethod("setEnabled", int[].class);
+      m.invoke(null, (Object) selectedIds);
+      return;
+    } catch (Throwable ignore) {
+      // fall through
+    }
+
+    try {
+      Method m = PropagationTracer.class.getMethod("setEnabledIds", int[].class);
+      m.invoke(null, (Object) selectedIds);
+      return;
+    } catch (Throwable ignore) {
+      // fall through
+    }
+
+    throw new GuidanceException("PropagationTracer does not support batch enabling selected ids.");
+  }
+
+  private Map<Integer, PropagationTraceSig> snapshotOriginalPropagationSigs(int[] selectedIds) {
+    Map<Integer, PropagationTraceSig> result = new HashMap<>(selectedIds.length);
+    for (int id : selectedIds) {
+      try {
+        result.put(id, PropagationTracer.getSig(id));
+      } catch (Throwable ignore) {
+        result.put(id, null);
+      }
+    }
+    return result;
+  }
+
+  private void collectOriginalPropagationSigs(TestClass testClass,
+                                              FrameworkMethod method,
+                                              Object[] args,
+                                              int[] selectedIds) throws Throwable {
+    PropagationTracer.clearAll();
+    try {
+      enablePropagationForSelectedIds(selectedIds);
+      getOutcome(testClass.getJavaClass(), method, args);
+      origSigs.putAll(snapshotOriginalPropagationSigs(selectedIds));
+      numRuns += 1; // one extra original rerun collects signatures for all selected mutants together
+    } catch (GuidanceException ge) {
+      // Fallback for older tracer implementations: rerun once per mutant.
+      for (int id : selectedIds) {
+        PropagationTraceSig s = null;
+        try {
+          PropagationTracer.clearAll();
+          PropagationTracer.setEnabledSingle(id);
+          getOutcome(testClass.getJavaClass(), method, args);
+          try {
+            s = PropagationTracer.getSig(id);
+          } catch (Throwable ignore) {
+            s = null;
+          }
+          numRuns += 1;
+        } finally {
+          PropagationTracer.clearAll();
+        }
+        origSigs.put(id, s);
+      }
+    } finally {
+      PropagationTracer.clearAll();
+    }
+  }
+
+// 用于 propagation 选择：只负责选 10 个“最近最少执行”的 mutant 做路径度量
+  // private final KLeastExecutedFilter propKLeastExecuted = new KLeastExecutedFilter(10);
 
   @Override
   public void run(TestClass testClass, FrameworkMethod method, Object[] args) throws Throwable {
@@ -481,11 +617,13 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     // 记录开始时间
     long startTime = System.currentTimeMillis();
 
+    long mappingStart = System.currentTimeMillis();
+
     //run with CCL 运行原始测试
     Outcome cclOutcome = getOutcome(testClass.getJavaClass(), method, args);
 
     // set up info 原始测试运行时间 序列化参数 实际运行的变异体计数
-    long trialTime = System.currentTimeMillis() - startTime;
+
     byte[] argBytes = Serializer.serialize(args);
     int run = 0;
     // 获取所有可用的变异体实例
@@ -495,28 +633,16 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
       mutationInstances = filter.filterMutants(mutationInstances);
     }
 
-    // ---- NEW: choose top-K mutants for propagation distance (default 10) ----
-    final int K = 10;
-    List<MutationInstance> selected = propKLeastExecuted.filterMutants(mutationInstances);
-    if (mutationInstances.size() > K) {
-      selected = mutationInstances.subList(0, K);
-    }
+    // ---- NEW: choose mutants for propagation distance ----
+    List<MutationInstance> selected = mutationInstances;
     int[] selectedIds = selected.stream().mapToInt(mi -> mi.id).toArray();
 
-    // ---- NEW: rerun ORIGINAL program once, only enabling selected ids ----
-    for (int id : selectedIds) {
-      PropagationTracer.clearAll();
-      PropagationTracer.setEnabledSingle(id);
-      // This run is only for collecting orig propagation sig for this id
-      getOutcome(testClass.getJavaClass(), method, args);
-      PropagationTraceSig s = PropagationTracer.getSig(id);
-      if (s != null) {
-        origSigs.put(id, s);
-      } else {
-        // optional: record missing sig as empty to keep distance stable
-        origSigs.put(id, PropagationTraceSig.empty());
-      }
+    if (cclOutcome.thrown == null && selectedIds.length > 0) {
+      collectOriginalPropagationSigs(testClass, method, args, selectedIds);
     }
+
+    long mappingElapsed = System.currentTimeMillis() - mappingStart;
+    mappingTime += mappingElapsed;
 
     // 存储所有变异体运行结果的列表
     List<MutantRunResult> results = new ArrayList<>();
@@ -525,26 +651,27 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
               .stream()
               .map(instance ->
                       executor.submit(() ->
-                      {
-                        // keep enabled single to reduce stray starts
-                        PropagationTracer.clearAll();
-                        PropagationTracer.setEnabledSingle(instance.id);
-                        Outcome out = dispatchMutationInstance(instance, testClass, argBytes, args, method);
-                        PropagationTraceSig sig = PropagationTracer.getSig(instance.id);
-                        return new MutantRunResult(instance, out, sig);
-                      }))
+                              // keep enabled single to reduce stray starts
+                              dispatchMutationInstanceWithSig(instance, testClass, argBytes, args, method)))
               .collect(Collectors.toList());
       // Use for loop to capture exceptions.
-      for (Future<MutantRunResult> future : futures) {
-        results.add(future.get());
+      for (int i = 0; i < futures.size(); i++) {
+        Future<MutantRunResult> future = futures.get(i);
+        MutationInstance inst = selected.get(i);
+        try {
+          results.add(future.get(TIMEOUT, TimeUnit.SECONDS));
+        } catch (TimeoutException te) {
+          future.cancel(true);
+          results.add(new MutantRunResult(
+                  inst,
+                  new Outcome(null, new MutationTimeoutException(TIMEOUT)),
+                  null
+          ));
+        }
       }
     } else {
       for (MutationInstance instance: selected) {
-        PropagationTracer.clearAll();
-        PropagationTracer.setEnabledSingle(instance.id);
-        Outcome out = dispatchMutationInstance(instance, testClass, argBytes, args, method);
-        PropagationTraceSig sig = PropagationTracer.getSig(instance.id);
-        results.add(new MutantRunResult(instance, out, sig));
+        results.add(dispatchMutationInstanceWithSig(instance, testClass, argBytes, args, method));
       }
     }
 // 分析变异体执行结果，判断哪些变异体被杀死了（被检测出来）
@@ -555,44 +682,41 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
       MutationInstance instance = r.instance;
 
       // ---- NEW: compute distance only if this mutant is in selected set ----
-      if (origSigs.containsKey(instance.id)) {
-        PropagationTraceSig mutSig = r.sig;
-        PropagationTraceSig origSig = origSigs.get(instance.id);
-        int dist = PropagationTraceSig.distance(origSig, mutSig);
+      PropagationTraceSig mutSig = r.sig;
+      PropagationTraceSig origSig = origSigs.get(instance.id);
+      int dist = safeDistance(origSig, mutSig);
+      if (dist >= 0) {
         propDistances.put(instance.id, dist);
+        pushRecentDist(dist);
       }
 
       numPathDiffComputed++;
-      PropagationTraceSig mutSig = r.sig;
-      PropagationTraceSig origSig = origSigs.get(instance.id);
       if (origSig == null || mutSig == null) {
         numPathSigMiss++;
+      } else if (dist < 0) {
+        numDistNaN++;
       } else {
-        int dist = PropagationTraceSig.distance(origSig, mutSig);
-        if (dist < 0) {
-          numDistNaN++;
-        } else {
-          numPathSigCollected++;
-          long ts = System.currentTimeMillis() / 1000;
-          int cycle = cyclesCompleted;
-          int parentId = currentParentInputIdx;
-          pathDiffLog.printf(
-                  "%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,%d\n",
-                  ts,
-                  numRuns,
-                  cycle,
-                  parentId,
-                  -1, // childId (预留)
-                  origSig.hashCode(),
-                  mutSig.hashCode(),
-                  dist,
-                  saturateNorm(dist, estimateTau()),
-                  dist,                 // distToTarget
-                  origSigs.size()       // targetsSize
-          );
-        }
-      }
+        numPathSigCollected++;
+        long ts = System.currentTimeMillis() / 1000;
+        int cycle = cyclesCompleted;
+        int parentId = currentParentInputIdx;
 
+        pathDiffLog.printf(
+                "%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,%d\n",
+                ts,
+                numTrials,
+                cycle,
+                parentId,
+                -1, // childId (预留)
+                origSig.hashCode(),
+                mutSig.hashCode(),
+                dist,
+                saturateNorm(dist, estimateTau()),
+                dist,            // distOrigMut
+                origSigs.size()  // targetsSize
+        );
+        pathDiffLog.flush();
+      }
 
       // MCL outcome and CCL outcome should be the same (either returned same value or threw same exception)
       // If this isn't the case, the mutant is killed.
@@ -629,7 +753,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     lastTrialMillis = completeTime;
 
     recentRun.add(run); // 记录本次运行的变异体数量
-    mappingTime += trialTime;
+    //mappingTime += trialTime;
     testingTime += completeTime;
     numRuns += run; // 累加变异体运行次数
   }
@@ -644,15 +768,25 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
   }
 
   private double estimateTau() {
-    if (recentRawDists.isEmpty()) return 10.0; // fallback
+    if (recentRawDists.isEmpty()) return 32.0; // stable fallback for typical rawDist range
     int[] arr = new int[recentRawDists.size()];
     int i = 0;
     for (int v : recentRawDists) arr[i++] = v;
     Arrays.sort(arr);
-    int mid = arr.length / 2;
-    double med = (arr.length % 2 == 1) ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2.0;
-    // avoid degenerate tau
-    return Math.max(1.0, med);
+    int idx = (int) Math.floor(0.75 * (arr.length - 1));
+    return Math.max(8.0, arr[idx]);
+  }
+
+  private double normTime(long ms) {
+    if (ms <= 0) return 0.0;
+    double ref = 20.0;
+    return ms / (ms + ref);
+  }
+
+  private double normSize(int sz) {
+    if (sz <= 0) return 0.0;
+    double ref = 64.0;
+    return sz / (sz + ref);
   }
 
   private static double saturateNorm(int d, double tau) {
@@ -679,73 +813,97 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
    */
   private PropMeta computePropMeta(int deltaKill, boolean hasNewCov) {
 
-    // ---------- Case 0: no propagation distances ----------
     if (propDistances == null || propDistances.isEmpty()) {
       double score =
               (deltaKill > 0 ? W_KILL : 0.0) +
-                      (hasNewCov  ? W_COV  : 0.0);
+                      (hasNewCov ? W_COV : 0.0);
 
       return new PropMeta(
-              0.0,                    // D
-              0.0,                    // N
-              score,                  // score
-              lastTrialMillis,        // exec time
-              currentInput.size(),    // input size
-              Collections.emptyMap()  // no hat distances
+              0.0,
+              0.0,
+              score,
+              lastTrialMillis,
+              currentInput.size(),
+              0,
+              false,
+              Collections.emptyMap()
       );
     }
 
-    // ---------- Step 1: update tau estimator ----------
-    for (int d : propDistances.values()) {
-      if (d >= 0) {
-        pushRecentDist(d);
-      }
-    }
     double tau = estimateTau();
 
-    // ---------- Step 2: build normalized (hat) distances ----------
     Map<Integer, Double> hatDists = new HashMap<>(propDistances.size());
     List<Double> hatList = new ArrayList<>(propDistances.size());
 
     for (Map.Entry<Integer, Integer> e : propDistances.entrySet()) {
       int mid = e.getKey();
-      int d   = (e.getValue() == null ? 0 : e.getValue());
+      int d = (e.getValue() == null ? 0 : e.getValue());
+      if (d <= 0) {
+        continue;
+      }
       double hat = saturateNorm(d, tau);
       hatDists.put(mid, hat);
       hatList.add(hat);
     }
 
-    // ---------- Step 3: D(s) = top-k average ----------
+    int numMutants = hatDists.size();
+    if (numMutants == 0) {
+      double score =
+              (deltaKill > 0 ? W_KILL : 0.0) +
+                      (hasNewCov ? W_COV : 0.0);
+      return new PropMeta(
+              0.0,
+              0.0,
+              score,
+              lastTrialMillis,
+              currentInput.size(),
+              0,
+              false,
+              Collections.emptyMap()
+      );
+    }
+
     double D = topKAverage(hatList, PROP_TOPK);
 
-    // ---------- Step 4: N(s) = novelty over bestDist ----------
     double gainSum = 0.0;
-    int cnt = 0;
+    int improved = 0;
     for (Map.Entry<Integer, Double> e : hatDists.entrySet()) {
       int mid = e.getKey();
       double hat = e.getValue();
       double best = bestDist.getOrDefault(mid, 0.0);
-      if (hat > best) {
-        gainSum += (hat - best);
+      double gain = hat - best;
+      if (gain > NOVELTY_EPS) {
+        gainSum += gain;
+        improved++;
       }
-      cnt++;
     }
-    double N = (cnt == 0) ? 0.0 : (gainSum / cnt);
+    double improveRatio = numMutants == 0 ? 0.0 : ((double) improved / numMutants);
+    double avgGain = improved == 0 ? 0.0 : (gainSum / improved);
+    double N = improveRatio * avgGain;
 
-    // ---------- Step 5: unified score ----------
+    double tNorm = normTime(lastTrialMillis);
+    double sNorm = normSize(currentInput.size());
+
     double score =
             (deltaKill > 0 ? W_KILL : 0.0) +
-                    (hasNewCov  ? W_COV  : 0.0) +
+                    (hasNewCov ? W_COV : 0.0) +
                     W_D * D +
-                    W_N * N ;
+                    W_N * N -
+                    W_T * tNorm -
+                    W_SZ * sNorm;
 
-    // ---------- Step 6: return side-channel metadata ----------
+    boolean hasSignal =
+            numMutants >= PROP_MIN_MUTANTS &&
+                    lastTrialMillis > 0;
+
     return new PropMeta(
             D,
             N,
             score,
             lastTrialMillis,
             currentInput.size(),
+            numMutants,
+            hasSignal,
             hatDists
     );
   }
@@ -757,62 +915,173 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
   protected void saveCurrentInput(IntHashSet responsibilities, String why) throws IOException {
     super.saveCurrentInput(responsibilities, why);
 
-    // only update bestDist if saved due to +prop
-    if (why == null || !why.contains("+prop")) {
-      return;
-    }
-
-    // fetch side-channel metadata for this input
     PropMeta meta = propMeta.get(currentInput);
     if (meta == null || meta.hatDists == null || meta.hatDists.isEmpty()) {
       return;
     }
 
-    // update bestDist using hat distances stored in PropMeta
+    boolean updated = false;
     for (Map.Entry<Integer, Double> e : meta.hatDists.entrySet()) {
       int mid = e.getKey();
       double hat = e.getValue();
       double old = bestDist.getOrDefault(mid, 0.0);
       if (hat > old) {
         bestDist.put(mid, hat);
+        updated = true;
       }
     }
 
-    // persist occasionally to reduce IO
-    bestDistDirtyWrites++;
-    if (bestDistDirtyWrites % 50 == 0) {
-      saveBestDist();
+    if (updated) {
+      bestDistDirtyWrites++;
+      if (bestDistDirtyWrites % 50 == 0) {
+        saveBestDist();
+      }
     }
   }
 
   // 种子选择：cycle 结束后按 propScore 排序 savedInputs（优先轮询高分种子）
+  private double currentAnnealFactor() {
+    if (maxDurationMillis == Long.MAX_VALUE) {
+      double pseudo = Math.min(1.0, numTrials / 100000.0);
+      return 1.0 - Math.exp(-SCHED_ANNEAL_K * pseudo);
+    }
+    long elapsed = Math.max(0L, new Date().getTime() - startTime.getTime());
+    double progress = Math.min(1.0, elapsed / (double) Math.max(1L, maxDurationMillis));
+    return 1.0 - Math.exp(-SCHED_ANNEAL_K * progress);
+  }
+
+  private double propagationUtility(PropMeta meta) {
+    if (meta == null || !meta.hasSignal) {
+      return 0.0;
+    }
+    double u = 0.4 * meta.D + 0.6 * meta.N;
+    if (u < 0.0) return 0.0;
+    if (u > 1.0) return 1.0;
+    return u;
+  }
+
+  private double propagationCost(PropMeta meta) {
+    if (meta == null) return 0.0;
+    double t = normTime(meta.execMillis);
+    double s = normSize(meta.size);
+    return 0.5 * t + 0.5 * s;
+  }
+
+  private double averageUtility() {
+    if (savedInputs.isEmpty()) return 0.0;
+    double sum = 0.0;
+    int cnt = 0;
+    for (Input in : savedInputs) {
+      PropMeta meta = propMeta.get(in);
+      if (meta != null && meta.hasSignal) {
+        sum += propagationUtility(meta);
+        cnt++;
+      }
+    }
+    return cnt == 0 ? 0.0 : (sum / cnt);
+  }
+
+  private int selectParentIndexFromWindow(int startIdx) {
+    if (savedInputs.isEmpty()) return 0;
+    final int n = savedInputs.size();
+    final int window = Math.min(SELECT_WINDOW, n);
+    final double rho = currentAnnealFactor();
+
+    int[] idxs = new int[window];
+    double maxBase = 1.0;
+    for (int i = 0; i < window; i++) {
+      int idx = (startIdx + i) % n;
+      idxs[i] = idx;
+      int base = super.getTargetChildrenForParent(savedInputs.get(idx));
+      if (base > maxBase) {
+        maxBase = base;
+      }
+    }
+
+    int bestIdx = idxs[0];
+    double bestScore = Double.NEGATIVE_INFINITY;
+    for (int idx : idxs) {
+      Input in = savedInputs.get(idx);
+      PropMeta meta = propMeta.get(in);
+      double baseNorm = super.getTargetChildrenForParent(in) / maxBase;
+      double util = propagationUtility(meta);
+      double cost = propagationCost(meta);
+      double score = (1.0 - rho) * baseNorm + rho * util - SELECT_COST_W * cost;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = idx;
+      }
+    }
+
+    scheduleDecisionLog.printf(
+            "%d,%d,%d,%d,%d,%s,%.4f,%.4f\n",
+            System.currentTimeMillis() / 1000,
+            cyclesCompleted,
+            numSavedInputs,
+            numFavoredLastCycle,
+            bestIdx,
+            "tdgf_window_select",
+            bestScore,
+            rho
+    );
+    scheduleDecisionLog.flush();
+
+    return bestIdx;
+  }
+
+  @Override
+  public InputStream getInput() throws GuidanceException {
+    conditionallySynchronize(multiThreaded, () -> {
+      runCoverage.clear();
+
+      if (!seedInputs.isEmpty()) {
+        currentInput = seedInputs.removeFirst();
+      } else if (savedInputs.isEmpty()) {
+        if (!blind && numTrials > 100_000) {
+          throw new GuidanceException("Too many trials without coverage; likely all assumption violations");
+        }
+        currentInput = createFreshInput();
+      } else {
+        Input currentParentInput = savedInputs.get(currentParentInputIdx);
+        int targetNumChildren = getTargetChildrenForParent(currentParentInput);
+        if (numChildrenGeneratedForCurrentParentInput >= targetNumChildren) {
+          int startIdx = (currentParentInputIdx + 1) % savedInputs.size();
+          if (startIdx == 0) {
+            completeCycle();
+          }
+          currentParentInputIdx = selectParentIndexFromWindow(startIdx);
+          numChildrenGeneratedForCurrentParentInput = 0;
+        }
+
+        Input parent = savedInputs.get(currentParentInputIdx);
+        currentInput = parent.fuzz(random);
+        numChildrenGeneratedForCurrentParentInput++;
+
+        try {
+          writeCurrentInputToFile(currentInputFile);
+        } catch (IOException ignore) {
+        }
+
+        this.runStart = new Date();
+        this.branchCount = 0;
+      }
+    });
+
+    return createParameterStream();
+  }
+
   @Override
   protected void completeCycle() {
     super.completeCycle();
 
-    // Reorder savedInputs by descending propagation score (side-channel)
-    savedInputs.sort((a, b) -> {
-      PropMeta ma = propMeta.get(a);
-      PropMeta mb = propMeta.get(b);
-      double sa = (ma == null ? 0.0 : ma.score);
-      double sb = (mb == null ? 0.0 : mb.score);
-      return Double.compare(sb, sa);
-    });
-
-    // keep parent index in range
-    if (!savedInputs.isEmpty()) {
-      currentParentInputIdx =
-              Math.min(currentParentInputIdx, savedInputs.size() - 1);
-    }
-
-    // persist bestDist at cycle boundary (safe point)
+    // Do not reorder savedInputs globally; preserve original Zest queue semantics.
     saveBestDist();
 
     long killedNow = deadMutants.size();
     long killedThisCycle = killedNow - lastCycleKilled;
     lastCycleKilled = killedNow;
 
-    scheduleLog.printf(
+    cycleSummaryLog.printf(
             "%d,%d,%d,%d,%d,%s,%d\n",
             System.currentTimeMillis() / 1000,
             cyclesCompleted,
@@ -822,7 +1091,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
             "cycle_summary",
             killedThisCycle
     );
-    scheduleLog.flush();
+    cycleSummaryLog.flush();
   }
 
   // 能量调度：在原 coverage 能量基础上乘距离因子
@@ -831,35 +1100,42 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
   protected int getTargetChildrenForParent(Input parentInput) {
     int base = super.getTargetChildrenForParent(parentInput);
 
-    // read propagation metadata (scheme A)
     PropMeta meta = propMeta.get(parentInput);
     numScheduleDecisions++;
-    double score = (meta == null ? 0.0 : meta.score);
-    double pathDiffUsed = (meta == null ? 0.0 : meta.D);
-    if (meta == null) {
+    double util = propagationUtility(meta);
+    double avgUtil = averageUtility();
+    double rho = currentAnnealFactor();
+    double cost = propagationCost(meta);
+
+    if (meta == null || !meta.hasSignal || avgUtil <= 0.0) {
       return base;
     }
 
-    double mult = 1.0 + ENERGY_ALPHA * meta.D + ENERGY_BETA * meta.N;
+    double relative = util / Math.max(1e-9, avgUtil);
+    double mult = ((1.0 - rho) + rho * relative) / (1.0 + ENERGY_COST_W * cost);
+    if (mult > ENERGY_MAX_MULT) {
+      mult = ENERGY_MAX_MULT;
+    }
+    if (mult < 0.5) {
+      mult = 0.5;
+    }
 
-    // avoid absurd explosion
-    if (mult < 0.1) mult = 0.1;
     long scaled = (long) Math.ceil(base * mult);
-
     if (scaled > ENERGY_CHILD_MAX) scaled = ENERGY_CHILD_MAX;
     if (scaled < 1) scaled = 1;
 
-    scheduleLog.printf(
+    scheduleDecisionLog.printf(
             "%d,%d,%d,%d,%d,%s,%.4f,%.4f\n",
             System.currentTimeMillis() / 1000,
             cyclesCompleted,
             numSavedInputs,
             numFavoredLastCycle,
             currentParentInputIdx,
-            "prop_score:",
-            score,
-            pathDiffUsed
+            "tdgf_energy",
+            util,
+            mult
     );
+    scheduleDecisionLog.flush();
     return (int) scaled;
   }
 
@@ -896,7 +1172,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
       currentParentInputDesc += currentParentInput.isFavored() ? "(favored)" : "(not favored)";
       // 显示已生成子代数量/目标子代数量
       currentParentInputDesc += " {" + numChildrenGeneratedForCurrentParentInput +
-          "/" + getTargetChildrenForParent(currentParentInput) + " mutations}";
+              "/" + getTargetChildrenForParent(currentParentInput) + " mutations}";
     }
 // ========== 计算覆盖率统计 ==========
     int nonZeroCount = totalCoverage.getNonZeroCount(); // 总覆盖率非零分支数
@@ -909,7 +1185,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
 
       if (LIBFUZZER_COMPAT_OUTPUT) {
         console.printf("#%,d\tNEW\tcov: %,d exec/s: %,d L: %,d\n", numTrials, nonZeroValidCount,
-            (long) intervalTrialsPerSec, currentInput.size());
+                (long) intervalTrialsPerSec, currentInput.size());
       } else if (!QUIET_MODE) {
         console.printf("\033[2J"); // 清屏
         console.printf("\033[H"); // 光标移动到左上角
@@ -920,37 +1196,37 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
         }
         console.printf("Results directory:    %s\n", this.outputDirectory.getAbsolutePath());
         console.printf("Elapsed time:         %s (%s)\n", millisToDuration(totalTime),
-            maxDurationMillis == Long.MAX_VALUE ? "no time limit"
-                : ("max " + millisToDuration(maxDurationMillis)));
+                maxDurationMillis == Long.MAX_VALUE ? "no time limit"
+                        : ("max " + millisToDuration(maxDurationMillis)));
         console.printf("Number of trials:     %,d\n", numTrials);
         console.printf("Number of executions: %,d\n", numRuns);
         console
-            .printf("Valid inputs:         %,d (%.2f%%)\n", numValid, numValid * 100.0 / numTrials);
+                .printf("Valid inputs:         %,d (%.2f%%)\n", numValid, numValid * 100.0 / numTrials);
         console.printf("Cycles completed:     %d\n", cyclesCompleted);
         console.printf("Unique failures:      %,d\n", uniqueFailures.size());
         console.printf("Queue size:           %,d (%,d favored last cycle)\n", savedInputs.size(),
-            numFavoredLastCycle);
+                numFavoredLastCycle);
         console.printf("Current parent input: %s\n", currentParentInputDesc);
         console.printf("Fuzzing Throughput:   %,d/sec now | %,d/sec overall\n",
-            (long) intervalTrialsPerSec, (long) trialsPerSec);
+                (long) intervalTrialsPerSec, (long) trialsPerSec);
         console.printf("Execution Speed:      %,d/sec now | %,d/sec overall\n",
-            (long) intervalRunsPerSec, (long) runsPerSec);
+                (long) intervalRunsPerSec, (long) runsPerSec);
         console.printf("Testing Time:         %s\n", millisToDuration(totalTime));
         console
-            .printf("Mapping Time:         %s (%.2f%% of total)\n", millisToDuration(mappingTime),
-                (double) mappingTime * 100.0 / (double) totalTime);
+                .printf("Mapping Time:         %s (%.2f%% of total)\n", millisToDuration(mappingTime),
+                        (double) mappingTime * 100.0 / (double) totalTime);
         // 变异体统计 覆盖率统计
         console.printf("Found Mutants:        %d\n", totalFound);
         console.printf("Recent Run Mutants:   %.2f (%.2f%% of total)\n", recentRun.get(),
-            recentRun.get() * 100.0 / totalFound);
+                recentRun.get() * 100.0 / totalFound);
         console.printf("Total coverage:       %,d branches (%.2f%% of map)\n", nonZeroCount,
-            nonZeroFraction);
+                nonZeroFraction);
         console.printf("Valid coverage:       %,d branches (%.2f%% of map)\n", nonZeroValidCount,
-            nonZeroValidFraction);
+                nonZeroValidFraction);
         console.printf("Total coverage:       %,d mutants\n",
-            ((MutationCoverage) totalCoverage).numCaughtMutants());
+                ((MutationCoverage) totalCoverage).numCaughtMutants());
         console.printf("Available to Cover:   %,d mutants\n",
-            ((MutationCoverage) totalCoverage).numSeenMutants());
+                ((MutationCoverage) totalCoverage).numSeenMutants());
       }
     }
     // ========== 写入统计文件 ==========
@@ -961,13 +1237,37 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
 已见变异体数, 最近运行数, 测试时间, 映射时间
      */
     String plotData = String.format(
-        "%d, %d, %d, %d, %d, %d, %.2f%%, %d, %d, %d, %.2f, %d, %d, %.2f%%, %d, %d, %d, %d, %d, %.2f, %d, %d",
-        TimeUnit.MILLISECONDS.toSeconds(now.getTime()), cyclesCompleted, currentParentInputIdx,
-        numSavedInputs, 0, 0, nonZeroFraction, uniqueFailures.size(), 0, 0, intervalTrialsPerSec,
-        numValid, numTrials - numValid, nonZeroValidFraction, nonZeroCount, nonZeroValidCount,
-        totalFound, deadMutants.size(), ((MutationCoverage) totalCoverage).numSeenMutants(),
-        recentRun.get(), testingTime, mappingTime);
+            "%d, %d, %d, %d, %d, %d, %.2f%%, %d, %d, %d, %.2f, %d, %d, %.2f%%, %d, %d, %d, %d, %d, %.2f, %d, %d",
+            TimeUnit.MILLISECONDS.toSeconds(now.getTime()), cyclesCompleted, currentParentInputIdx,
+            numSavedInputs, 0, 0, nonZeroFraction, uniqueFailures.size(), 0, 0, intervalTrialsPerSec,
+            numValid, numTrials - numValid, nonZeroValidFraction, nonZeroCount, nonZeroValidCount,
+            totalFound, deadMutants.size(), ((MutationCoverage) totalCoverage).numSeenMutants(),
+            recentRun.get(), testingTime, mappingTime);
     appendLineToFile(statsFile, plotData);
+
+    try {
+      if (propCountersLog != null) {
+        cmu.pasta.mu2.instrument.PropagationTracer.Counters c =
+                cmu.pasta.mu2.instrument.PropagationTracer.snapshotCounters();
+        propCountersLog.printf(
+                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                TimeUnit.MILLISECONDS.toSeconds(now.getTime()),
+                cyclesCompleted,
+                numTrials,
+                c.startCalled,
+                c.hitLabelCalled,
+                c.hitLabelEffective,
+                c.endCalled,
+                c.forceEndCalled,
+                c.sigFinalized,
+                c.startSkippedDisabled,
+                c.startSkippedActive,
+                c.startSkippedRepeated,
+                c.endMethodMismatch
+        );
+      }
+    } catch (Throwable ignore) {
+    }
 
     if (force && !hasInput()) {
       File summary = new File(outputDirectory, "summary.csv");
@@ -984,6 +1284,14 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
         );
       } catch (IOException e) {
         e.printStackTrace();
+      } finally {
+        try { saveBestDist(); } catch (Throwable ignore) {}
+        // close logs safely
+        try { if (pathDiffLog != null) pathDiffLog.close(); } catch (Throwable ignore) {}
+        try { if (seedScoreLog != null) seedScoreLog.close(); } catch (Throwable ignore) {}
+        try { if (cycleSummaryLog != null) cycleSummaryLog.close(); } catch (Throwable ignore) {}
+        try { if (scheduleDecisionLog != null) scheduleDecisionLog.close(); } catch (Throwable ignore) {}
+        try { if (propCountersLog != null) propCountersLog.close(); } catch (Throwable ignore) {}
       }
     }
   }
@@ -992,10 +1300,10 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
   protected String getTitle() {
     if (blind) {
       return "Generator-based random fuzzing (no guidance)\n" +
-          "--------------------------------------------\n";
+              "--------------------------------------------\n";
     } else {
       return "Mutation-Guided & Driected Fuzzing\n" +
-          "--------------------------\n";
+              "--------------------------\n";
     }
   }
 }

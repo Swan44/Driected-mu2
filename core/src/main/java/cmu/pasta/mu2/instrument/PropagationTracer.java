@@ -6,13 +6,15 @@ import java.util.Map;
 
 /**
  * Runtime tracer used by ASM-inserted hooks.
+ *
  * Design goals:
  * - extremely low overhead when disabled (fast checks)
- * - no CFG build; only label hits are recorded
+ * - no CFG build; only lightweight event/transition sketches are recorded
  * - trace window: after mutation point, within the current method only
+ *
  * Notes:
  * - For original program (CCL) enable ONE mutant id per rerun (setEnabledSingle),
- *   and Cartographer-instrumented code calls maybeStartAfterInsn(id, methodId).
+ *   and Cartographer-instrumented code calls startAtMutationPoint(id, methodId).
  * - For mutant program (MCL) we forceStart(id, methodId) right after replacement instruction.
  */
 public final class PropagationTracer {
@@ -48,16 +50,31 @@ public final class PropagationTracer {
         boolean active;
         int activeMutantId;
         int activeMethodId;
-        long hash;
+
+        long nodeBitsLo;
+        long nodeBitsHi;
+        long edgeBitsLo;
+        long edgeBitsHi;
         int steps;
+
+        int lastLabelId;
+        boolean hasLastLabel;
+
         int startedMutantId = Integer.MIN_VALUE;
 
         void resetActiveOnly() {
             active = false;
             activeMutantId = 0;
             activeMethodId = 0;
-            hash = 0L;
+
+            nodeBitsLo = 0L;
+            nodeBitsHi = 0L;
+            edgeBitsLo = 0L;
+            edgeBitsHi = 0L;
             steps = 0;
+
+            lastLabelId = 0;
+            hasLastLabel = false;
         }
 
         void resetAll() {
@@ -81,7 +98,45 @@ public final class PropagationTracer {
         return Arrays.binarySearch(ids, mutantId) >= 0;
     }
 
-    /** 统一：在 mutation opportunity 对应字节码执行前调用 */
+    private static void setBit128Node(State s, int labelId) {
+        long h1 = mix64(0x9E3779B97F4A7C15L ^ (long) labelId);
+        int idx1 = (int) (h1 & 127L);
+        if (idx1 < 64) {
+            s.nodeBitsLo |= (1L << idx1);
+        } else {
+            s.nodeBitsHi |= (1L << (idx1 - 64));
+        }
+
+        long h2 = mix64(0xC2B2AE3D27D4EB4FL ^ (long) labelId);
+        int idx2 = (int) (h2 & 127L);
+        if (idx2 < 64) {
+            s.nodeBitsLo |= (1L << idx2);
+        } else {
+            s.nodeBitsHi |= (1L << (idx2 - 64));
+        }
+    }
+
+    private static void setBit128Edge(State s, int prevLabelId, int curLabelId) {
+        long edgeKey = (((long) prevLabelId) << 32) ^ (curLabelId & 0xffffffffL);
+
+        long h1 = mix64(0x165667B19E3779F9L ^ edgeKey);
+        int idx1 = (int) (h1 & 127L);
+        if (idx1 < 64) {
+            s.edgeBitsLo |= (1L << idx1);
+        } else {
+            s.edgeBitsHi |= (1L << (idx1 - 64));
+        }
+
+        long h2 = mix64(0x85EBCA77C2B2AE63L ^ edgeKey);
+        int idx2 = (int) (h2 & 127L);
+        if (idx2 < 64) {
+            s.edgeBitsLo |= (1L << idx2);
+        } else {
+            s.edgeBitsHi |= (1L << (idx2 - 64));
+        }
+    }
+
+    /** Called right before the mutation opportunity bytecode executes. */
     public static void startAtMutationPoint(int mutantId, int methodId) {
         Counters c = CNT.get();
         c.startCalled++;
@@ -107,9 +162,13 @@ public final class PropagationTracer {
         s.activeMutantId = mutantId;
         s.activeMethodId = methodId;
 
-        // 原程序和变异体必须一致
-        s.hash = mix64(0x9E3779B97F4A7C15L ^ mutantId ^ (((long) methodId) << 32));
+        s.nodeBitsLo = 0L;
+        s.nodeBitsHi = 0L;
+        s.edgeBitsLo = 0L;
+        s.edgeBitsHi = 0L;
         s.steps = 0;
+        s.lastLabelId = 0;
+        s.hasLastLabel = false;
     }
 
     public static void hitLabel(int methodId, int labelId) {
@@ -121,8 +180,14 @@ public final class PropagationTracer {
         if (s.activeMethodId != methodId) return;
 
         c.hitLabelEffective++;
-        long x = ((long) labelId << 1) ^ (labelId * 0x9E3779B9L);
-        s.hash = mix64(s.hash ^ x);
+
+        setBit128Node(s, labelId);
+        if (s.hasLastLabel) {
+            setBit128Edge(s, s.lastLabelId, labelId);
+        }
+
+        s.lastLabelId = labelId;
+        s.hasLastLabel = true;
         s.steps++;
     }
 
@@ -137,7 +202,16 @@ public final class PropagationTracer {
             return;
         }
 
-        DONE.get().put(s.activeMutantId, new PropagationTraceSig(s.hash, s.steps));
+        DONE.get().put(
+                s.activeMutantId,
+                new PropagationTraceSig(
+                        s.nodeBitsLo,
+                        s.nodeBitsHi,
+                        s.edgeBitsLo,
+                        s.edgeBitsHi,
+                        s.steps
+                )
+        );
         c.sigFinalized++;
         s.resetActiveOnly();
     }
@@ -149,7 +223,16 @@ public final class PropagationTracer {
         State s = STATE.get();
         if (!s.active) return;
 
-        DONE.get().put(s.activeMutantId, new PropagationTraceSig(s.hash, s.steps));
+        DONE.get().put(
+                s.activeMutantId,
+                new PropagationTraceSig(
+                        s.nodeBitsLo,
+                        s.nodeBitsHi,
+                        s.edgeBitsLo,
+                        s.edgeBitsHi,
+                        s.steps
+                )
+        );
         c.sigFinalized++;
         s.resetActiveOnly();
     }
