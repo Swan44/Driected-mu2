@@ -185,42 +185,42 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
   private int currentPropMinMutants = PROP_MIN_MUTANTS_FLOOR;
 
   // rescue-save gate: only allow a small number of strong propagation-only seeds into corpus
-  private static final double PROP_RESCUE_TH_D = Double.parseDouble(System.getProperty("mu2.PROP_RESCUE_TH_D", "0.72"));
-  private static final double PROP_RESCUE_TH_N = Double.parseDouble(System.getProperty("mu2.PROP_RESCUE_TH_N", "0.06"));
+  private static final double PROP_RESCUE_TH_D = Double.parseDouble(System.getProperty("mu2.PROP_RESCUE_TH_D", "0.80"));
+  private static final double PROP_RESCUE_TH_N = Double.parseDouble(System.getProperty("mu2.PROP_RESCUE_TH_N", "0.08"));
 
   // propagation-based favored gate should be stricter than save gate
-  private static final double PROP_FAV_STRONG_D = Double.parseDouble(System.getProperty("mu2.PROP_FAV_STRONG_D", "0.78"));
-  private static final double PROP_FAV_STRONG_N = Double.parseDouble(System.getProperty("mu2.PROP_FAV_STRONG_N", "0.04"));
-  private static final double PROP_FAV_N_ONLY   = Double.parseDouble(System.getProperty("mu2.PROP_FAV_N_ONLY",   "0.08"));
+  private static final double PROP_FAV_STRONG_D = Double.parseDouble(System.getProperty("mu2.PROP_FAV_STRONG_D", "0.85"));
+  private static final double PROP_FAV_STRONG_N = Double.parseDouble(System.getProperty("mu2.PROP_FAV_STRONG_N", "0.06"));
+  private static final double PROP_FAV_N_ONLY   = Double.parseDouble(System.getProperty("mu2.PROP_FAV_N_ONLY",   "0.12"));
 
   // propagation measurements that are too slow should not gain bonus
-  private static final long PROP_MAX_EXEC_MS = Long.getLong("mu2.PROP_MAX_EXEC_MS", 80L);
+  private static final long PROP_MAX_EXEC_MS = Long.getLong("mu2.PROP_MAX_EXEC_MS", 50L);
 
   // novelty gate: only gains above bestDist + eps count as real novelty
-  private static final double NOVELTY_EPS = Double.parseDouble(System.getProperty("mu2.NOVELTY_EPS", "0.006"));
+  private static final double NOVELTY_EPS = Double.parseDouble(System.getProperty("mu2.NOVELTY_EPS", "0.004"));
 
   // energy shaping (small bounded bonus instead of aggressive multiplicative explosion)
-  private static final double ENERGY_GAMMA = Double.parseDouble(System.getProperty("mu2.ENERGY_GAMMA", "0.85"));
-  private static final double ENERGY_MAX_MULT = Double.parseDouble(System.getProperty("mu2.ENERGY_MAX_MULT", "1.6"));
+  private static final double ENERGY_GAMMA = Double.parseDouble(System.getProperty("mu2.ENERGY_GAMMA", "1.20"));
+  private static final double ENERGY_MAX_MULT = Double.parseDouble(System.getProperty("mu2.ENERGY_MAX_MULT", "2.0"));
   private static final int ENERGY_CHILD_MAX = Integer.getInteger("mu2.ENERGY_CHILD_MAX", 3000);
 
   // score weights
   private static final double W_KILL = Double.parseDouble(System.getProperty("mu2.W_KILL", "2.0"));
   private static final double W_COV  = Double.parseDouble(System.getProperty("mu2.W_COV",  "1.0"));
   private static final double W_D    = Double.parseDouble(System.getProperty("mu2.W_D",    "1.0"));
-  private static final double W_N    = Double.parseDouble(System.getProperty("mu2.W_N",    "1.8"));
+  private static final double W_N    = Double.parseDouble(System.getProperty("mu2.W_N",    "2.2"));
   private static final double W_T    = Double.parseDouble(System.getProperty("mu2.W_T",    "0.4"));
   private static final double W_SZ   = Double.parseDouble(System.getProperty("mu2.W_SZ",   "0.2"));
 
   // TDGF-style local reranking on top of Zest queue semantics
   private static final int SELECT_WINDOW = Integer.getInteger("mu2.SELECT_WINDOW", 16);
-  private static final double SELECT_COST_W = Double.parseDouble(System.getProperty("mu2.SELECT_COST_W", "0.15"));
+  private static final double SELECT_COST_W = Double.parseDouble(System.getProperty("mu2.SELECT_COST_W", "0.10"));
 
   // annealing / exploitation strength
-  private static final double SCHED_ANNEAL_K = Double.parseDouble(System.getProperty("mu2.SCHED_ANNEAL_K", "1.8"));
+  private static final double SCHED_ANNEAL_K = Double.parseDouble(System.getProperty("mu2.SCHED_ANNEAL_K", "3.0"));
 
   // energy scaling based on utility relative to average utility
-  private static final double ENERGY_COST_W = Double.parseDouble(System.getProperty("mu2.ENERGY_COST_W", "0.20"));
+  private static final double ENERGY_COST_W = Double.parseDouble(System.getProperty("mu2.ENERGY_COST_W", "0.15"));
 
   // --- bestDist persistence ---
   private final File bestDistFile;
@@ -433,7 +433,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
 
     boolean hasNewCov = false;
     for (String s : criteria) {
-      if (s.equals("+cov") || s.equals("+valid") || s.equals("+count")) {
+      if (s.equals("+cov") || s.equals("+valid")) {
         hasNewCov = true;
         break;
       }
@@ -441,6 +441,12 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
 
     PropMeta meta = computePropMeta(newKilledMutants, hasNewCov);
     propMeta.put(currentInput, meta);
+
+    boolean onlyCount = (criteria.size() == 1 && criteria.contains("+count"));
+    boolean weakPropagation = !meta.hasSignal || (meta.D < 0.55 && meta.N < 0.03);
+    if (onlyCount && weakPropagation) {
+      criteria.clear();
+    }
 
     boolean baseSaved = !criteria.isEmpty();
     boolean allowInvalid = (result == Result.SUCCESS) || (result == Result.INVALID && !SAVE_ONLY_VALID);
@@ -455,6 +461,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
             !baseSaved &&
                     allowInvalid &&
                     meta.hasSignal &&
+                    meta.numMutants >= currentPropMinMutants &&
                     meta.execMillis > 0 &&
                     meta.execMillis <= PROP_MAX_EXEC_MS &&
                     meta.D >= PROP_RESCUE_TH_D &&
@@ -467,6 +474,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     // Propagation-based favored should remain high-precision / low-recall.
     boolean propFav =
             meta.hasSignal &&
+                    meta.numMutants >= currentPropMinMutants &&
                     meta.execMillis > 0 &&
                     meta.execMillis <= PROP_MAX_EXEC_MS &&
                     ((meta.D >= PROP_FAV_STRONG_D && meta.N >= PROP_FAV_STRONG_N) ||
@@ -843,8 +851,8 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     if (recentRawDists.size() < 8) {
       return saturateNorm(d, estimateTau());
     }
-    double q10 = estimateQuantile(0.20);
-    double q90 = estimateQuantile(0.95);
+    double q10 = estimateQuantile(0.10);
+    double q90 = estimateQuantile(0.90);
     if (q90 <= q10 + 1.0) {
       return saturateNorm(d, estimateTau());
     }
@@ -929,7 +937,6 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     double D = topKAverage(hatList, currentPropTopK);
 
     List<Double> gains = new ArrayList<>(numMutants);
-    int improved = 0;
     for (Map.Entry<Integer, Double> e : hatDists.entrySet()) {
       int mid = e.getKey();
       double hat = e.getValue();
@@ -937,12 +944,9 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
       double gain = hat - best;
       if (gain > NOVELTY_EPS) {
         gains.add(gain);
-        improved++;
       }
     }
-    double improveRatio = numMutants == 0 ? 0.0 : ((double) improved / numMutants);
-    double topGain = gains.isEmpty() ? 0.0 : topKAverage(gains, Math.min(currentPropTopK, 3));
-    double N = 0.7 * topGain + 0.3 * improveRatio;
+    double N = gains.isEmpty() ? 0.0 : topKAverage(gains, Math.min(currentPropTopK, 3));
 
     double tNorm = normTime(lastTrialMillis);
     double sNorm = normSize(currentInput.size());
@@ -998,8 +1002,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
       double hat = e.getValue();
       double old = bestDist.getOrDefault(mid, 0.0);
       if (hat > old) {
-        double blended = Math.max(old, 0.92 * old + 0.08 * hat);
-        bestDist.put(mid, blended);
+        bestDist.put(mid, hat);
         updated = true;
       }
     }
@@ -1027,8 +1030,8 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     if (meta == null || !meta.hasSignal) {
       return 0.0;
     }
-    double noveltyBoost = Math.min(1.0, meta.N * 3.0);
-    double u = 0.60 * meta.D + 0.40 * noveltyBoost;
+    double noveltyBoost = Math.min(1.0, meta.N * 4.0);
+    double u = 0.70 * meta.D + 0.30 * noveltyBoost;
     if (u < 0.0) return 0.0;
     if (u > 1.0) return 1.0;
     return u;
@@ -1315,7 +1318,6 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
             numValid, numTrials - numValid, nonZeroValidFraction, nonZeroCount, nonZeroValidCount,
             totalFound, deadMutants.size(), ((MutationCoverage) totalCoverage).numSeenMutants(),
             recentRun.get(), testingTime, mappingTime);
-    appendLineToFile(statsFile, plotData);
     if (!plotData.equals(lastPlotDataLine)) {
       appendLineToFile(statsFile, plotData);
       lastPlotDataLine = plotData;
