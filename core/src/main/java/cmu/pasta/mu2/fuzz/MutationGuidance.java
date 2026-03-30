@@ -184,14 +184,12 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
   // 当前 trial 对应的动态门槛，在 run() 中按 selected.size() 更新
   private int currentPropMinMutants = PROP_MIN_MUTANTS_FLOOR;
 
-  // rescue-save gate: only allow a small number of strong propagation-only seeds into corpus
-  private static final double PROP_RESCUE_TH_D = Double.parseDouble(System.getProperty("mu2.PROP_RESCUE_TH_D", "0.80"));
-  private static final double PROP_RESCUE_TH_N = Double.parseDouble(System.getProperty("mu2.PROP_RESCUE_TH_N", "0.08"));
+  private static final double PROP_RESCUE_TH_D = Double.parseDouble(System.getProperty("mu2.PROP_RESCUE_TH_D", "0.90"));
+  private static final double PROP_RESCUE_TH_N = Double.parseDouble(System.getProperty("mu2.PROP_RESCUE_TH_N", "0.12"));
 
-  // propagation-based favored gate should be stricter than save gate
-  private static final double PROP_FAV_STRONG_D = Double.parseDouble(System.getProperty("mu2.PROP_FAV_STRONG_D", "0.85"));
-  private static final double PROP_FAV_STRONG_N = Double.parseDouble(System.getProperty("mu2.PROP_FAV_STRONG_N", "0.06"));
-  private static final double PROP_FAV_N_ONLY   = Double.parseDouble(System.getProperty("mu2.PROP_FAV_N_ONLY",   "0.12"));
+  private static final double PROP_FAV_STRONG_D = Double.parseDouble(System.getProperty("mu2.PROP_FAV_STRONG_D", "0.88"));
+  private static final double PROP_FAV_STRONG_N = Double.parseDouble(System.getProperty("mu2.PROP_FAV_STRONG_N", "0.08"));
+  //private static final double PROP_FAV_N_ONLY   = Double.parseDouble(System.getProperty("mu2.PROP_FAV_N_ONLY",   "0.12"));
 
   // propagation measurements that are too slow should not gain bonus
   private static final long PROP_MAX_EXEC_MS = Long.getLong("mu2.PROP_MAX_EXEC_MS", 50L);
@@ -200,8 +198,8 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
   private static final double NOVELTY_EPS = Double.parseDouble(System.getProperty("mu2.NOVELTY_EPS", "0.004"));
 
   // energy shaping (small bounded bonus instead of aggressive multiplicative explosion)
-  private static final double ENERGY_GAMMA = Double.parseDouble(System.getProperty("mu2.ENERGY_GAMMA", "1.20"));
-  private static final double ENERGY_MAX_MULT = Double.parseDouble(System.getProperty("mu2.ENERGY_MAX_MULT", "2.0"));
+  private static final double ENERGY_GAMMA = Double.parseDouble(System.getProperty("mu2.ENERGY_GAMMA", "0.45"));
+  private static final double ENERGY_MAX_MULT = Double.parseDouble(System.getProperty("mu2.ENERGY_MAX_MULT", "1.25"));
   private static final int ENERGY_CHILD_MAX = Integer.getInteger("mu2.ENERGY_CHILD_MAX", 3000);
 
   // score weights
@@ -425,7 +423,9 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
   @Override
   protected List<String> checkSavingCriteriaSatisfied(Result result) {
     List<String> criteria = super.checkSavingCriteriaSatisfied(result);
-    int newKilledMutants = ((MutationCoverage) totalCoverage).updateMutants(((MutationCoverage) runCoverage));
+
+    int newKilledMutants =
+            ((MutationCoverage) totalCoverage).updateMutants(((MutationCoverage) runCoverage));
     if (newKilledMutants > 0) {
       criteria.add(String.format("+%d mutants %s", newKilledMutants, mutantExceptionList.toString()));
       currentInput.setFavored();
@@ -433,7 +433,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
 
     boolean hasNewCov = false;
     for (String s : criteria) {
-      if (s.equals("+cov") || s.equals("+valid")) {
+      if (s.equals("+cov") || s.equals("+valid") || s.equals("+count")) {
         hasNewCov = true;
         break;
       }
@@ -442,26 +442,20 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     PropMeta meta = computePropMeta(newKilledMutants, hasNewCov);
     propMeta.put(currentInput, meta);
 
-    boolean onlyCount = (criteria.size() == 1 && criteria.contains("+count"));
-    boolean weakPropagation = !meta.hasSignal || (meta.D < 0.55 && meta.N < 0.03);
-    if (onlyCount && weakPropagation) {
-      criteria.clear();
-    }
-
     boolean baseSaved = !criteria.isEmpty();
     boolean allowInvalid = (result == Result.SUCCESS) || (result == Result.INVALID && !SAVE_ONLY_VALID);
 
-    // If the input is already worth saving for the base guidance, only annotate it with propagation info.
+    // 1) base guidance 决定的保存，绝不被 propagation 否决
     if (baseSaved && allowInvalid && meta.hasSignal) {
       criteria.add(String.format("+prop(D=%.3f,N=%.3f,S=%.3f)", meta.D, meta.N, meta.score));
     }
 
-    // Propagation-only rescue save: be very conservative.
+    // 2) propagation-only rescue save：更严格，只允许极强信号补充少量种子
     boolean allowPropRescue =
             !baseSaved &&
                     allowInvalid &&
                     meta.hasSignal &&
-                    meta.numMutants >= currentPropMinMutants &&
+                    meta.numMutants >= Math.max(4, currentPropMinMutants) &&
                     meta.execMillis > 0 &&
                     meta.execMillis <= PROP_MAX_EXEC_MS &&
                     meta.D >= PROP_RESCUE_TH_D &&
@@ -471,14 +465,14 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
       criteria.add(String.format("+prop(D=%.3f,N=%.3f,S=%.3f)", meta.D, meta.N, meta.score));
     }
 
-    // Propagation-based favored should remain high-precision / low-recall.
+    // 3) propagation favored：仅 strong D+N 时触发，不允许 N-only favored
     boolean propFav =
             meta.hasSignal &&
                     meta.numMutants >= currentPropMinMutants &&
                     meta.execMillis > 0 &&
                     meta.execMillis <= PROP_MAX_EXEC_MS &&
-                    ((meta.D >= PROP_FAV_STRONG_D && meta.N >= PROP_FAV_STRONG_N) ||
-                            (meta.N >= PROP_FAV_N_ONLY));
+                    meta.D >= PROP_FAV_STRONG_D &&
+                    meta.N >= PROP_FAV_STRONG_N;
 
     if (propFav) {
       currentInput.setFavored();
@@ -1030,8 +1024,12 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     if (meta == null || !meta.hasSignal) {
       return 0.0;
     }
-    double noveltyBoost = Math.min(1.0, meta.N * 4.0);
-    double u = 0.70 * meta.D + 0.30 * noveltyBoost;
+
+    // novelty 只做小幅辅助，避免 N 主导
+    double noveltyBoost = Math.min(1.0, meta.N * 3.0);
+
+    double u = 0.80 * meta.D + 0.20 * noveltyBoost;
+
     if (u < 0.0) return 0.0;
     if (u > 1.0) return 1.0;
     return u;
@@ -1058,22 +1056,37 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     return cnt == 0 ? 0.0 : (sum / cnt);
   }
 
-  private EnergyDecision computeEnergyDecision(Input parentInput) {
-    int base = super.getTargetChildrenForParent(parentInput);
-    PropMeta meta = propMeta.get(parentInput);
-    double util = propagationUtility(meta);
-    double avgUtil = averageUtility();
-    double rho = currentAnnealFactor();
-    double cost = propagationCost(meta);
+  private EnergyDecision computeEnergyDecision(Input parent) {
+    int base = super.getTargetChildrenForParent(parent);
 
-    if (meta == null || !meta.hasSignal || avgUtil <= 0.0) {
-      return new EnergyDecision(base, util, 1.0);
+    PropMeta meta = propMeta.get(parent);
+    if (meta == null || !meta.hasSignal) {
+      return new EnergyDecision(base, 0.0, 1.0);
     }
 
+    double util = propagationUtility(meta);
+    double cost = propagationCost(meta);
+
+    // 当前 saved corpus 的平均 utility，用于相对缩放
+    double sumUtil = 0.0;
+    int cnt = 0;
+    for (Input in : savedInputs) {
+      PropMeta m = propMeta.get(in);
+      if (m != null && m.hasSignal) {
+        sumUtil += propagationUtility(m);
+        cnt++;
+      }
+    }
+    double avgUtil = cnt > 0 ? (sumUtil / cnt) : util;
     double relative = util / Math.max(1e-9, avgUtil);
-    double mult = (1.0 + ENERGY_GAMMA * rho * (relative - 1.0)) / (1.0 + ENERGY_COST_W * cost);
+
+    // 轻量 energy 调整：只保留小范围乘子
+    double rho = currentAnnealFactor();
+    double mult = (1.0 + ENERGY_GAMMA * rho * (relative - 1.0))
+            / (1.0 + ENERGY_COST_W * cost);
+
     if (mult > ENERGY_MAX_MULT) mult = ENERGY_MAX_MULT;
-    if (mult < 0.65) mult = 0.65;
+    if (mult < 0.90) mult = 0.90;
 
     long scaled = (long) Math.ceil(base * mult);
     if (scaled > ENERGY_CHILD_MAX) scaled = ENERGY_CHILD_MAX;
@@ -1081,7 +1094,6 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
 
     return new EnergyDecision((int) scaled, util, mult);
   }
-
   private void logEnergyDecisionForCurrentParent() {
     if (savedInputs.isEmpty()) return;
     Input parent = savedInputs.get(currentParentInputIdx);
@@ -1112,7 +1124,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     }
   }
 
-  private int selectParentIndexFromWindow(int startIdx) {
+  /*private int selectParentIndexFromWindow(int startIdx) {
     if (savedInputs.isEmpty()) return 0;
     final int n = savedInputs.size();
     final int window = Math.min(SELECT_WINDOW, n);
@@ -1158,7 +1170,7 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
     scheduleDecisionLog.flush();
 
     return bestIdx;
-  }
+  }*/
 
   @Override
   public InputStream getInput() throws GuidanceException {
@@ -1180,7 +1192,8 @@ public class MutationGuidance extends ZestGuidance implements DiffFuzzGuidance {
           if (startIdx == 0) {
             completeCycle();
           }
-          currentParentInputIdx = selectParentIndexFromWindow(startIdx);
+          // 恢复原始队列轮转，不再使用 propagation 做 window rerank
+          currentParentInputIdx = startIdx;
           numChildrenGeneratedForCurrentParentInput = 0;
         }
 
